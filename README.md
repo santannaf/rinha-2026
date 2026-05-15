@@ -183,19 +183,6 @@ em 120s, 1.0 CPU e 350 MB total):
 
 **Ganho total: −44% no p99, +9.5% no score.**
 
-**Comparação com líderes da Rinha 2026:**
-
-| Equipe / Stack | p99 | score |
-|---|---:|---:|
-| pedrosakuma (.NET NativeAOT + AVX2 manual) | 1.06 ms | 5974 |
-| daniloitagyba (.NET + LB custom fd-passing) | 1.13 ms | 5946 |
-| **este projeto (Java 25 + GraalVM puro)** | **2.81 ms** | **3030** |
-
-O *gap* pra alcançar o top exige técnicas fora do escopo "Java
-puro": SIMD AVX2 manual via JNI/C, ou LB custom escrito em C com
-fd-passing. Em Java + GraalVM SVM sem JNI, estamos próximos do teto
-prático.
-
 ---
 
 ## Como rodar
