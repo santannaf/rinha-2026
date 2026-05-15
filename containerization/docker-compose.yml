@@ -1,0 +1,95 @@
+x-api: &api
+  build:
+    context: ..
+    dockerfile: containerization/Dockerfile
+  image: rinha-26-java:native
+
+# Default Rinha 2026: HAProxy + upstream UDS em tmpfs.
+#
+# Orçamento total: 1.0 CPU / 350 MB.
+# Distribuição: 0.35 (api1) + 0.35 (api2) + 0.30 (lb) = 1.0 CPU.
+#
+# HAProxy escolhido como default após bench A/B (p99 médio 2.93ms / score
+# 3009, vs nginx 3.96ms / 2879). Variantes alternativas:
+#   docker-compose.nginx-uds.yml      — nginx + UDS (anterior default)
+#   docker-compose.nginx-tcp.yml      — nginx + TCP (controle)
+#   docker-compose.sonoforevis.yml    — so-no-forevis L4 (não funcional aqui)
+
+services:
+  api1:
+    <<: *api
+    hostname: api1
+    environment:
+      HTTP_SERVER: "NIO"
+      UDS_PATH: /sockets/api1.sock
+      DATASET_PATH: /resources/references.bin
+      IVF_INDEX_PATH: /resources/references.idx
+      VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
+      QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
+      IVF_CENTROIDS: "4096"
+      IVF_NPROBE: "${IVF_NPROBE:-2}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
+      PERF_LOG: "${PERF_LOG:-false}"
+      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
+      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-true}"
+      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+    volumes:
+      - sockets:/sockets
+    cpuset: "0"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.35"
+          memory: "155M"
+
+  api2:
+    <<: *api
+    hostname: api2
+    environment:
+      HTTP_SERVER: "NIO"
+      UDS_PATH: /sockets/api2.sock
+      DATASET_PATH: /resources/references.bin
+      IVF_INDEX_PATH: /resources/references.idx
+      VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
+      QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
+      IVF_CENTROIDS: "4096"
+      IVF_NPROBE: "${IVF_NPROBE:-2}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
+      PERF_LOG: "${PERF_LOG:-false}"
+      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
+      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-true}"
+      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+    volumes:
+      - sockets:/sockets
+    cpuset: "1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.35"
+          memory: "155M"
+
+  lb:
+    image: haproxy:3.0-alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    cpuset: "2"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: "40M"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs

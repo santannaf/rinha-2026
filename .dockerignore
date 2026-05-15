@@ -1,0 +1,26 @@
+# Tudo que não precisa entrar no build context.
+.gradle/
+build/
+.idea/
+.kotlin/
+out/
+.git/
+.gitignore
+.vscode/
+
+# Pastas grandes que não são usadas pelo container.
+test/
+tools/
+
+# resources/references.bin é GERADO no builder (a partir do .gz).
+resources/references.bin
+
+# Exemplos só usados em dev/postman.
+resources/example-payloads.json
+resources/example-references.json
+
+# Logs/output do dev.
+*.log
+*.tmp
+*.swp
+.DS_Store

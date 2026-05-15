@@ -1,0 +1,81 @@
+x-api: &api
+  build:
+    context: ..
+    dockerfile: containerization/Dockerfile
+  image: rinha-26-java:native
+
+# Variante de controle: nginx + upstream TCP (sem UDS).
+# Mesma topologia / mesmo binário do docker-compose.yml; diferença é só o
+# transport entre LB e backends (TCP loopback via DNS do compose em vez de
+# socket UDS em tmpfs).
+#
+# Útil pra A/B: rodar este e o docker-compose.yml e medir delta — isola
+# o ganho real do UDS no LB nginx.
+
+services:
+  api1:
+    <<: *api
+    hostname: api1
+    environment:
+      HTTP_SERVER: "NIO"
+      SERVER_PORT: "8080"
+      # UDS_PATH vazio → backend escuta TCP em SERVER_PORT
+      UDS_PATH: ""
+      DATASET_PATH: /resources/references.bin
+      IVF_INDEX_PATH: /resources/references.idx
+      VECTOR_INDEX: IVF
+      IVF_CENTROIDS: "4096"
+      IVF_NPROBE: "${IVF_NPROBE:-2}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
+      PERF_LOG: "${PERF_LOG:-false}"
+      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
+      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-true}"
+      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+    cpuset: "0"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.35"
+          memory: "160M"
+
+  api2:
+    <<: *api
+    hostname: api2
+    environment:
+      HTTP_SERVER: "NIO"
+      SERVER_PORT: "8080"
+      UDS_PATH: ""
+      DATASET_PATH: /resources/references.bin
+      IVF_INDEX_PATH: /resources/references.idx
+      VECTOR_INDEX: IVF
+      IVF_CENTROIDS: "4096"
+      IVF_NPROBE: "${IVF_NPROBE:-2}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
+      PERF_LOG: "${PERF_LOG:-false}"
+      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
+      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-true}"
+      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+    cpuset: "1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.35"
+          memory: "160M"
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx-tcp.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+    cpuset: "2"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: "40M"

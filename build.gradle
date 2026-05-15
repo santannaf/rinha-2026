@@ -1,0 +1,124 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'org.graalvm.buildtools.native' version '0.11.5'
+}
+
+group = 'com.rinha'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'com.rinha.Main'
+    // Dev defaults. Em prod (container), JAVA_OPTS sobrescreve heap/metaspace/etc.
+    applicationDefaultJvmArgs = [
+            '-XX:+UseG1GC',
+            '-Xms256m',
+            '-Xmx1024m',
+            '--enable-native-access=ALL-UNNAMED',
+            '--add-modules=jdk.incubator.vector'
+    ]
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['--add-modules=jdk.incubator.vector']
+}
+
+tasks.register('analyzeFailures', JavaExec) {
+    group = 'application'
+    description = 'Replica o pipeline contra test-data e dumpa FP/FN com vetor + top-K.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.rinha.tools.AnalyzeFailures'
+    jvmArgs = ['--add-modules=jdk.incubator.vector']
+}
+
+tasks.register('buildIvfIndex', JavaExec) {
+    group = 'application'
+    description = 'Constrói o IVF index e salva em .idx pra mmap-load no startup.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.rinha.tools.BuildIvfIndex'
+    jvmArgs = ['--add-modules=jdk.incubator.vector']
+    args = ['resources/references.idx']
+    def datasetIn = System.getenv('DATASET_PATH') ?: 'resources/references.bin'
+    def idxOut = 'resources/references.idx'
+    environment 'DATASET_PATH', datasetIn
+    inputs.file(datasetIn)
+    outputs.file(idxOut)
+}
+
+tasks.register('buildQuantizedDataset', JavaExec) {
+    group = 'application'
+    description = 'Gera references.qbin (dataset quantizado int16) a partir do .bin float32.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.rinha.tools.BuildQuantizedDataset'
+    jvmArgs = ['--add-modules=jdk.incubator.vector']
+    args = ['resources/references.qbin']
+    def datasetIn = System.getenv('DATASET_PATH') ?: 'resources/references.bin'
+    def datasetOut = 'resources/references.qbin'
+    environment 'DATASET_PATH', datasetIn
+    inputs.file(datasetIn)
+    outputs.file(datasetOut)
+}
+
+tasks.register('convertDataset', JavaExec) {
+    group = 'application'
+    description = 'Converte references.json.gz para references.bin (formato binário compacto).'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.rinha.tools.ConvertDataset'
+    jvmArgs = ['--add-modules=jdk.incubator.vector']
+    args = ['resources/references.bin']
+    def datasetIn = System.getenv('DATASET_PATH') ?: 'resources/references.json.gz'
+    def datasetOut = 'resources/references.bin'
+    environment 'DATASET_PATH', datasetIn
+    inputs.file(datasetIn)
+    outputs.file(datasetOut)
+}
+
+// ---------------------------------------------------------------------------
+// GraalVM native-image (AOT). Motivação: dois backends + LB em 350 MB.
+// JVM puro come ~100 MB de overhead por instância (metaspace + code cache +
+// JIT). AOT corta isso pra ~30 MB, deixando margem pra duas APIs.
+//
+// -march=x86-64-v3 = Haswell baseline (AVX2 + FMA + BMI1/2 + popcnt).
+// ---------------------------------------------------------------------------
+graalvmNative {
+    binaries {
+        main {
+            imageName = 'rinha-backend-26-java'
+            mainClass = 'com.rinha.Main'
+            fallback = false
+            verbose = false
+            sharedLibrary = false
+            buildArgs.addAll([
+                    '--enable-native-access=ALL-UNNAMED',
+                    '--add-modules=jdk.incubator.vector',
+                    '-H:+UnlockExperimentalVMOptions',
+                    '-H:+ReportExceptionStackTraces',
+                    '-march=x86-64-v3'
+            ])
+            jvmArgs.addAll(['--add-modules=jdk.incubator.vector'])
+        }
+    }
+    metadataRepository {
+        enabled = true
+    }
+    agent {
+        defaultMode = 'standard'
+        metadataCopy {
+            inputTaskNames.add('run')
+            outputDirectories.add(
+                    "src/main/resources/META-INF/native-image/com.rinha/rinha-backend-26-java"
+            )
+            mergeWithExisting = true
+        }
+    }
+}
