@@ -7,9 +7,9 @@ x-api: &api
 # Distribuição: 0.35 (api1) + 0.35 (api2) + 0.30 (lb) = 1.0 CPU.
 #
 # HAProxy escolhido como default após bench A/B (p99 médio 2.93ms / score
-# 3009, vs nginx 3.96ms / 2879). Variantes alternativas:
-#   docker-compose.nginx-uds.yml      — nginx + UDS (anterior default)
-#   docker-compose.nginx-tcp.yml      — nginx + TCP (controle)
+# 3009, vs nginx 3.96ms / 2879). Variantes alternativas em containerization/:
+#   containerization/docker-compose.nginx-uds.yml — nginx + UDS
+#   containerization/docker-compose.nginx-tcp.yml — nginx + TCP
 
 services:
   api1:
