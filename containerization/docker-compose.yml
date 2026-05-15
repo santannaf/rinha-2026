@@ -1,8 +1,5 @@
 x-api: &api
-  build:
-    context: ..
-    dockerfile: containerization/Dockerfile
-  image: rinha-26-java:native
+  image: thalessantanna/rinha-2026-java:0.1.0
 
 # Default Rinha 2026: HAProxy + upstream UDS em tmpfs.
 #
@@ -13,7 +10,6 @@ x-api: &api
 # 3009, vs nginx 3.96ms / 2879). Variantes alternativas:
 #   docker-compose.nginx-uds.yml      — nginx + UDS (anterior default)
 #   docker-compose.nginx-tcp.yml      — nginx + TCP (controle)
-#   docker-compose.sonoforevis.yml    — so-no-forevis L4 (não funcional aqui)
 
 services:
   api1:

@@ -1,8 +1,5 @@
 x-api: &api
-  build:
-    context: ..
-    dockerfile: containerization/Dockerfile
-  image: rinha-26-java:native
+  image: thalessantanna/rinha-2026-java:0.1.0
 
 # Variante de controle: nginx + upstream TCP (sem UDS).
 # Mesma topologia / mesmo binário do docker-compose.yml; diferença é só o
