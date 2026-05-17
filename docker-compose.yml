@@ -1,16 +1,6 @@
 x-api: &api
   image: thalessantanna/rinha-2026-java:0.1.0
 
-# Default Rinha 2026: HAProxy + upstream UDS em tmpfs.
-#
-# Orçamento total: 1.0 CPU / 350 MB.
-# Distribuição: 0.35 (api1) + 0.35 (api2) + 0.30 (lb) = 1.0 CPU.
-#
-# HAProxy escolhido como default após bench A/B (p99 médio 2.93ms / score
-# 3009, vs nginx 3.96ms / 2879). Variantes alternativas em containerization/:
-#   containerization/docker-compose.nginx-uds.yml — nginx + UDS
-#   containerization/docker-compose.nginx-tcp.yml — nginx + TCP
-
 services:
   api1:
     <<: *api
@@ -21,7 +11,6 @@ services:
       DATASET_PATH: /resources/references-clustered.bin
       IVF_INDEX_PATH: /resources/references.idx
       VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
-      QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
       IVF_CENTROIDS: "4096"
       IVF_NPROBE: "${IVF_NPROBE:-2}"
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
@@ -48,7 +37,6 @@ services:
       DATASET_PATH: /resources/references-clustered.bin
       IVF_INDEX_PATH: /resources/references.idx
       VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
-      QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
       IVF_CENTROIDS: "4096"
       IVF_NPROBE: "${IVF_NPROBE:-2}"
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"

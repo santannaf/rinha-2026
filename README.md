@@ -1,6 +1,6 @@
 # Rinha de Backend 2026 — API antifraude (Java 25 + GraalVM)
 
-API HTTP que decide em **~3 milissegundos** se uma transação de cartão
+API HTTP que decide em **~6 ms (p99)** se uma transação de cartão
 deve ser aprovada ou bloqueada. Java puro, compilado em binário nativo
 via GraalVM, sem framework — servidor HTTP escrito do zero usando
 `java.nio`. Roda em 1.0 CPU / 350 MB de RAM totais.
@@ -166,22 +166,22 @@ em 120s, 1.0 CPU e 350 MB total):
 
 | Métrica | Valor |
 |---|---:|
-| **p99 latência** | **~2.8 ms** |
-| **score final** | **~3030** |
-| failure_rate | 1.75% |
+| **p99 latência** | **~5.6 ms** |
+| **score final** | **~5251** |
+| failure_rate | 0% |
 | HTTP errors | 0 |
 
 **Histórico do projeto:**
 
-| Etapa | p99 | score |
-|---|---:|---:|
-| Início (Undertow + TCP) | 5.07 ms | 2768 |
-| + NIO próprio + UDS | 3.96 ms | 2879 |
-| + mmap pre-fault/hugepage + early-stop | 3.96 ms | 2879 |
-| + HAProxy (vs nginx) ⭐ | **2.93 ms** | **3009** |
-| **Estado atual (3 runs média)** | **2.81 ms** | **3030** |
+| Etapa | p99 | failure | score |
+|---|---:|---:|---:|
+| Início (Undertow + TCP) | 5.07 ms | — | 2768 |
+| + NIO + UDS + mmap + HAProxy | 2.81 ms | 1.77% | 3030 |
+| + mapa de risco MCC corrigido | 2.88 ms | 0.28% | 4065 |
+| + repair exato (busca com 0% de erro) | 35.9 ms | 0% | 4444 |
+| + layout contíguo + split + int16 | **5.60 ms** | **0%** | **5251** |
 
-**Ganho total: −44% no p99, +9.5% no score.**
+**Da submissão inicial ao estado atual: failure_rate 1.77% → 0%, score +85%.**
 
 ---
 

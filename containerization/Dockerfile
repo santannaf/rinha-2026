@@ -27,12 +27,7 @@ RUN DATASET_PATH=resources/references.json.gz \
 RUN DATASET_PATH=resources/references.bin IVF_CENTROIDS=4096 IVF_NPROBE=4 \
     ./gradlew --no-daemon buildIvfIndex --args="resources/references.idx resources/references-clustered.bin"
 
-# 3) Quantiza o dataset pra int16 (.qbin) — opcional em runtime via
-#    VECTOR_INDEX=IVF_Q16. Custo: ~5s de build, +84 MiB na imagem.
-RUN DATASET_PATH=resources/references.bin \
-    ./gradlew --no-daemon buildQuantizedDataset --args="resources/references.qbin"
-
-# 4) Compila o binário nativo.
+# 3) Compila o binário nativo.
 RUN ./gradlew --no-daemon nativeCompile
 
 # ----- runtime ----- (debian-slim só com libc + zlib que o binário linka)
@@ -48,13 +43,11 @@ RUN apt-get update \
 COPY --from=builder /workspace/build/native/nativeCompile/rinha-backend-26-java /app/rinha-backend-26-java
 COPY --from=builder /workspace/resources/references-clustered.bin /resources/references-clustered.bin
 COPY --from=builder /workspace/resources/references.idx /resources/references.idx
-COPY --from=builder /workspace/resources/references.qbin /resources/references.qbin
 COPY --from=builder /workspace/resources/normalization.json /resources/normalization.json
 COPY --from=builder /workspace/resources/mcc_risk.json /resources/mcc_risk.json
 
 ENV DATASET_PATH=/resources/references-clustered.bin
 ENV IVF_INDEX_PATH=/resources/references.idx
-ENV QBIN_PATH=/resources/references.qbin
 ENV VECTOR_INDEX=IVF
 ENV IVF_CENTROIDS=4096
 ENV IVF_NPROBE=4

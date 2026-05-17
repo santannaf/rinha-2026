@@ -55,20 +55,6 @@ tasks.register('buildIvfIndex', JavaExec) {
     outputs.file('resources/references-clustered.bin')
 }
 
-tasks.register('buildQuantizedDataset', JavaExec) {
-    group = 'application'
-    description = 'Gera references.qbin (dataset quantizado int16) a partir do .bin float32.'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'com.rinha.tools.BuildQuantizedDataset'
-    jvmArgs = ['--add-modules=jdk.incubator.vector']
-    args = ['resources/references.qbin']
-    def datasetIn = System.getenv('DATASET_PATH') ?: 'resources/references.bin'
-    def datasetOut = 'resources/references.qbin'
-    environment 'DATASET_PATH', datasetIn
-    inputs.file(datasetIn)
-    outputs.file(datasetOut)
-}
-
 tasks.register('convertDataset', JavaExec) {
     group = 'application'
     description = 'Converte references.json.gz para references.bin (formato binário compacto).'
