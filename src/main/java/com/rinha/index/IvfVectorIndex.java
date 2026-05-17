@@ -47,8 +47,10 @@ public final class IvfVectorIndex implements VectorIndex {
     private static final int KMEANS_SAMPLE_SIZE = 128_000;
     /**
      * Clusters acima deste tamanho são divididos via sub-k-means. Cluster
-     * menor → bounding box mais justa → poda mais forte no repair. Não afeta
-     * corretude — a busca segue exata pra qualquer clustering.
+     * menor → bounding box mais justa → poda mais forte no repair → menos
+     * vetores varridos por request. Não afeta corretude — a busca é exata pra
+     * qualquer clustering. MEDIDO: subir pra 4096 (poucos clusters grandes)
+     * afrouxa as bboxes e PIORA o p90/p95 — manter pequeno.
      */
     private static final int MAX_CLUSTER_SIZE = 512;
     /** Iterações do k-means full-batch usado ao dividir um cluster grande. */
@@ -63,9 +65,12 @@ public final class IvfVectorIndex implements VectorIndex {
     private double[] centroids;       // numCentroids * DIM (heap)
     private int[] postingStart;       // numCentroids + 1 (heap)
     private IntBuffer postingList;    // tamanho N (heap ou mmap; identidade no clustered)
-    // Vetores em int16 (×QUANT_SCALE). mmap'd quando carregado do clustered .bin
-    // (duas instâncias compartilham as páginas), heap quando build() in-memory.
-    private ShortBuffer rows;
+    // Vetores em int16 (×QUANT_SCALE), sempre em heap short[]. Antes era um
+    // ShortBuffer mmap'd sobre o .bin clustered; trocado por array no heap —
+    // acesso direto sem indireção de Buffer e zero risco de page fault, que na
+    // storage virtualizada lenta da Rinha jogava a cauda do p99 pra dezenas de
+    // ms (e congelava o event loop single-thread numa falta de página).
+    private short[] rows;
     // Bounding box por cluster em float32 (build/serialização) e int16 (busca).
     private float[] bboxMin;
     private float[] bboxMax;
@@ -95,7 +100,7 @@ public final class IvfVectorIndex implements VectorIndex {
     private IvfVectorIndex(DistanceMetric metric, int nProbe,
                            ReferenceDataset dataset,
                            double[] centroids, int[] postingStart, IntBuffer postingList,
-                           float[] bboxMin, float[] bboxMax) {
+                           float[] bboxMin, float[] bboxMax, short[] rows) {
         this.metric = metric;
         this.numCentroids = postingStart.length - 1;
         this.nProbe = nProbe;
@@ -106,7 +111,7 @@ public final class IvfVectorIndex implements VectorIndex {
         this.postingList = postingList;
         this.bboxMin = bboxMin;
         this.bboxMax = bboxMax;
-        this.rows = dataset.quantized() ? dataset.flatShorts() : null;
+        this.rows = rows;
         this.identityPostings = isIdentity(postingList);
         quantizeBbox();
     }
@@ -125,7 +130,7 @@ public final class IvfVectorIndex implements VectorIndex {
             throw new IllegalStateException("withNProbe requires build()/loadMmap first");
         }
         return new IvfVectorIndex(metric, newNProbe, dataset,
-                centroids, postingStart, postingList, bboxMin, bboxMax);
+                centroids, postingStart, postingList, bboxMin, bboxMax, rows);
     }
 
     @Override
@@ -247,7 +252,7 @@ public final class IvfVectorIndex implements VectorIndex {
         for (int idx = 0; idx < n * dim; idx++) {
             rowsArr[idx] = (short) Math.round(flat.get(idx) * scale);
         }
-        rows = ShortBuffer.wrap(rowsArr);
+        rows = rowsArr;
         quantizeBbox();
     }
 
@@ -544,23 +549,24 @@ public final class IvfVectorIndex implements VectorIndex {
     private long l2sqInt(short[] q16, int off) {
         long sum = 0;
         for (int d = 0; d < ReferenceDataset.DIM; d++) {
-            int diff = q16[d] - rows.get(off + d);
+            int diff = q16[d] - rows[off + d];
             sum += (long) diff * diff;
         }
         return sum;
     }
 
-    /** Variante com early-exit: aborta após 8 dims se a parcial já ≥ cutoff. */
+    /**
+     * L2² inteira com early-exit POR DIMENSÃO: aborta a soma assim que a
+     * parcial atinge {@code cutoff}. A maioria dos candidatos está longe e
+     * morre nas primeiras dims — só os poucos que entram no top-K pagam as 14.
+     * (Antes o corte era único, após 8 dims.)
+     */
     private long l2sqIntCutoff(short[] q16, int off, long cutoff) {
         long sum = 0;
-        for (int d = 0; d < 8; d++) {
-            int diff = q16[d] - rows.get(off + d);
+        for (int d = 0; d < ReferenceDataset.DIM; d++) {
+            int diff = q16[d] - rows[off + d];
             sum += (long) diff * diff;
-        }
-        if (sum >= cutoff) return sum;
-        for (int d = 8; d < ReferenceDataset.DIM; d++) {
-            int diff = q16[d] - rows.get(off + d);
-            sum += (long) diff * diff;
+            if (sum >= cutoff) return sum;
         }
         return sum;
     }
@@ -877,7 +883,8 @@ public final class IvfVectorIndex implements VectorIndex {
             for (int i = 0; i < k * dim; i++) bboxMax[i] = bbMaxFB.get(i);
 
             return new IvfVectorIndex(metric, nProbe, dataset,
-                    centroids, postingStart, postingList, bboxMin, bboxMax);
+                    centroids, postingStart, postingList, bboxMin, bboxMax,
+                    heapRows(dataset));
         }
     }
 
@@ -892,6 +899,26 @@ public final class IvfVectorIndex implements VectorIndex {
             if (pl.get(j) != j) return false;
         }
         return true;
+    }
+
+    /**
+     * Vetores int16 do dataset como {@code short[]} em heap. Se o dataset já é
+     * heap-backed (MMAP=false → {@link com.rinha.dataset.BinaryDataset#read}),
+     * devolve o array de trás — zero cópia. Só copia no fallback mmap.
+     */
+    private static short[] heapRows(ReferenceDataset dataset) {
+        if (!dataset.quantized()) {
+            throw new IllegalStateException(
+                    "IVF runtime requer o dataset clustered int16 (.bin dtype int16)");
+        }
+        ShortBuffer sb = dataset.flatShorts();
+        int n = dataset.size() * ReferenceDataset.DIM;
+        if (sb.hasArray() && sb.arrayOffset() == 0 && sb.array().length == n) {
+            return sb.array();
+        }
+        short[] r = new short[n];
+        sb.get(0, r, 0, n);
+        return r;
     }
 
     private static double maxOf(double[] a, int size) {
