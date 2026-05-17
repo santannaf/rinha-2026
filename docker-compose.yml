@@ -5,7 +5,6 @@ services:
   api1:
     <<: *api
     hostname: api1
-    command: ["-XX:+PrintGC"]   # DIAGNÓSTICO temporário — remover depois
     environment:
       HTTP_SERVER: "NIO"
       UDS_PATH: /sockets/api1.sock
@@ -31,7 +30,6 @@ services:
   api2:
     <<: *api
     hostname: api2
-    command: ["-XX:+PrintGC"]   # DIAGNÓSTICO temporário — remover depois
     environment:
       HTTP_SERVER: "NIO"
       UDS_PATH: /sockets/api2.sock
