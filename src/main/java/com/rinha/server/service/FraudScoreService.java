@@ -67,18 +67,21 @@ public final class FraudScoreService {
             PerfLog.log("search", tSearch0);
 
             long tScore0 = PerfLog.now();
-            int fraudCount = scorer.countFrauds(resultScratch, dataset);
 
-            // Boundary repair opt-in via env BOUNDARY_FALLBACK.
+            // Repair sem gate: scanAllWithBboxPrune devolve o top-K exato-por-
+            // distância (poda por bbox é lower-bound correto), então roda em
+            // TODA request quando BOUNDARY_FALLBACK está ligado. O gate antigo
+            // (fraudCount in {2,3}) decidia o repair com base na contagem
+            // APROXIMADA do fast pass — quando ela errava, casos de borda não
+            // eram reparados. Sem gate, o resultado é exato pra 100% das queries.
             VectorIndex fallbackIndex = holder.fallbackIndex();
-            if (fallbackIndex instanceof IvfVectorIndex ivfRepair
-                    && (fraudCount == 2 || fraudCount == 3)) {
+            if (fallbackIndex instanceof IvfVectorIndex ivfRepair) {
                 long tFb0 = PerfLog.now();
                 ivfRepair.scanAllWithBboxPrune(queryScratch, topK, resultScratch);
                 PerfLog.log("repair", tFb0);
-                fraudCount = scorer.countFrauds(resultScratch, dataset);
             }
 
+            int fraudCount = scorer.countFrauds(resultScratch, dataset);
             PerfLog.log("score", tScore0);
             PerfLog.log("total", tStart);
             return fraudCount;

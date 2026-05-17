@@ -10,6 +10,7 @@ import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.MappedByteBuffer;
+import java.nio.ShortBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,36 +18,41 @@ import java.nio.file.StandardOpenOption;
 import java.util.Random;
 
 /**
- * IVF (Inverted File Index) — versão funcional com persistência.
+ * IVF (Inverted File Index) com repair exato e layout int16 clustered.
  *
- * Esquema:
- *  1. Amostra {@code numCentroids} centróides aleatoriamente do dataset.
- *  2. Refina via mini-batch k-means (10 iters × 50k samples).
- *  3. Para cada vetor i, calcula o centróide mais próximo e adiciona
- *     i na lista invertida desse centróide.
- *  4. Em searchTopK, encontra os {@code nProbe} centróides mais próximos
- *     do query e varre apenas os vetores dessas listas, mantendo top-K.
+ * Build (offline, float64): k-means grosso → split de clusters grandes →
+ * centroids/postingStart/postingList/bbox. Persistido via
+ * {@link #writeClusteredArtifacts}.
  *
- * Layout interno após build (ou load):
- *  - centroids: double[K * DIM] (heap, ~459 KB pra K=4096; precisão p/ k-means).
- *  - postingStart: int[K+1] (heap, ~16 KB; offsets cumulativos).
- *  - postingList: IntBuffer de tamanho N (~12 MB pra 3M). Heap quando
- *    construído na hora, mmap'd quando carregado do .idx — neste último caso
- *    duas instâncias compartilham as páginas via page cache do kernel.
+ * Runtime: o dataset clustered é int16 (×{@link ReferenceDataset#QUANT_SCALE},
+ * lossless — referências já na grade de 1/10000) e as linhas estão reordenadas
+ * por cluster → varredura de cluster é sequencial. A busca usa aritmética
+ * inteira (acumulador long).
  *
- * Serialização: ver {@link #save(Path)} e {@link #loadMmap(DistanceMetric, int, Path, ReferenceDataset)}.
- * Reusar um .idx pré-construído tira ~6 min de startup com 0.6 CPU cap.
+ * {@link #searchTopK} faz a fast pass (varre os nProbe clusters mais próximos)
+ * e registra os clusters varridos em {@link SearchResult}. {@link #scanAllWithBboxPrune}
+ * (o repair) varre todos os OUTROS clusters podando por bounding box — pula os
+ * já varridos, então cada cluster é visto uma vez (sem dedup). O resultado é o
+ * top-K exato.
  */
 public final class IvfVectorIndex implements VectorIndex {
 
     /** Magic do arquivo .idx: "RVII" (Rinha Vector Index, Ivf). */
     private static final int MAGIC = ('R') | ('V' << 8) | ('I' << 16) | ('I' << 24);
-    /** v2: adicionou bboxMin/bboxMax por cluster pra repair com bbox-prune. */
+    /** v2: bboxMin/bboxMax por cluster (float32). */
     private static final int VERSION = 2;
     private static final int HEADER_BYTES = 32;
 
-    private static final int KMEANS_ITERATIONS = 10;
-    private static final int KMEANS_SAMPLE_SIZE = 50_000;
+    private static final int KMEANS_ITERATIONS = 18;
+    private static final int KMEANS_SAMPLE_SIZE = 128_000;
+    /**
+     * Clusters acima deste tamanho são divididos via sub-k-means. Cluster
+     * menor → bounding box mais justa → poda mais forte no repair. Não afeta
+     * corretude — a busca segue exata pra qualquer clustering.
+     */
+    private static final int MAX_CLUSTER_SIZE = 512;
+    /** Iterações do k-means full-batch usado ao dividir um cluster grande. */
+    private static final int SPLIT_KMEANS_ITERATIONS = 10;
 
     private final DistanceMetric metric;
     private final int numCentroids;
@@ -56,16 +62,18 @@ public final class IvfVectorIndex implements VectorIndex {
     private ReferenceDataset dataset;
     private double[] centroids;       // numCentroids * DIM (heap)
     private int[] postingStart;       // numCentroids + 1 (heap)
-    private IntBuffer postingList;    // tamanho N (heap ou mmap)
-    // Bounding box por cluster: min[c*DIM+d] / max[c*DIM+d] em float32 (~460 KB
-    // pra K=4096). Permite distance(query, bbox) como lower-bound para podar
-    // o cluster inteiro durante o scan-all-with-bbox-prune do repair.
+    private IntBuffer postingList;    // tamanho N (heap ou mmap; identidade no clustered)
+    // Vetores em int16 (×QUANT_SCALE). mmap'd quando carregado do clustered .bin
+    // (duas instâncias compartilham as páginas), heap quando build() in-memory.
+    private ShortBuffer rows;
+    // Bounding box por cluster em float32 (build/serialização) e int16 (busca).
     private float[] bboxMin;
     private float[] bboxMax;
-    // Early-stop class-aware: sai do scan dos nProbe clusters cedo se
-    // o top-K já está cheio e tem unanimidade de classe (todos fraud ou
-    // todos legit). Toggle via IVF_EARLY_STOP env. Quando ligado, salva
-    // ~30-50% do varrer das posting lists em queries "fáceis".
+    private short[] bboxMinS;
+    private short[] bboxMaxS;
+    // Mantido para compatibilidade do setter chamado pelo Main; ignorado —
+    // com repair em toda request o early-stop seria inseguro (deixaria
+    // clusters não varridos quando o repair pula os "probados").
     private volatile boolean earlyStop = false;
 
     public IvfVectorIndex(DistanceMetric metric, int numCentroids, int nProbe, long seed) {
@@ -76,9 +84,8 @@ public final class IvfVectorIndex implements VectorIndex {
     }
 
     /**
-     * Construtor para instâncias carregadas via {@link #loadMmap}. O caller
-     * já decidiu sobre centróides/postings; numCentroids é só usado pra
-     * preservar o getter, e o seed fica 0 (não vai re-construir nada).
+     * Construtor para instâncias carregadas via {@link #loadMmap}. Deriva os
+     * arrays int16 (rows do dataset, bbox quantizada) a partir do que foi lido.
      */
     private IvfVectorIndex(DistanceMetric metric, int nProbe,
                            ReferenceDataset dataset,
@@ -94,18 +101,19 @@ public final class IvfVectorIndex implements VectorIndex {
         this.postingList = postingList;
         this.bboxMin = bboxMin;
         this.bboxMax = bboxMax;
+        this.rows = dataset.quantized() ? dataset.flatShorts() : null;
+        quantizeBbox();
+    }
+
+    public void setEarlyStop(boolean enabled) {
+        this.earlyStop = enabled;   // ignorado — ver campo earlyStop.
     }
 
     /**
-     * Devolve uma instância nova compartilhando centróides / postings com esta,
-     * mas configurada com outro {@code nProbe}. Usado pelo boundary fallback:
-     * mesmo índice, busca com mais probes nos casos ambíguos. Zero overhead de
-     * memória — postingList já é IntBuffer (heap ou mmap).
+     * Instância nova compartilhando centróides / postings / rows com esta, com
+     * outro {@code nProbe}. Usado pelo boundary fallback. Zero overhead de
+     * memória — postingList e rows são buffers compartilhados.
      */
-    public void setEarlyStop(boolean enabled) {
-        this.earlyStop = enabled;
-    }
-
     public IvfVectorIndex withNProbe(int newNProbe) {
         if (dataset == null || centroids == null || postingStart == null || postingList == null) {
             throw new IllegalStateException("withNProbe requires build()/loadMmap first");
@@ -118,13 +126,14 @@ public final class IvfVectorIndex implements VectorIndex {
     public void build(ReferenceDataset dataset) {
         this.dataset = dataset;
         int n = dataset.size();
-        int effective = Math.min(numCentroids, Math.max(1, n));
+        int coarseK = Math.min(numCentroids, Math.max(1, n));
         int dim = ReferenceDataset.DIM;
-
-        Random rnd = new Random(seed);
-        centroids = new double[effective * dim];
         FloatBuffer flat = dataset.flatFloats();
-        for (int c = 0; c < effective; c++) {
+        Random rnd = new Random(seed);
+
+        // 1. K-means grosso: coarseK centróides iniciados de amostras aleatórias.
+        centroids = new double[coarseK * dim];
+        for (int c = 0; c < coarseK; c++) {
             int src = n == 0 ? 0 : rnd.nextInt(n);
             int srcOff = src * dim;
             int dstOff = c * dim;
@@ -132,55 +141,180 @@ public final class IvfVectorIndex implements VectorIndex {
                 centroids[dstOff + d] = flat.get(srcOff + d);
             }
         }
+        refineKMeans(flat, n, coarseK, dim, rnd);
 
-        refineKMeans(flat, n, effective, dim, rnd);
-
-        // Atribuição final de todos os N vetores ao centróide mais próximo.
-        int[] assignment = new int[n];
-        int[] sizes = new int[effective];
+        // 2. Atribui todos os N vetores ao centróide grosso mais próximo.
+        int[] coarseAssign = new int[n];
+        int[] coarseSizes = new int[coarseK];
         for (int i = 0; i < n; i++) {
             int best = 0;
             double bestD = Double.POSITIVE_INFINITY;
             int offI = i * dim;
-            for (int c = 0; c < effective; c++) {
+            for (int c = 0; c < coarseK; c++) {
                 double d = metric.distance(flat, offI, centroids, c * dim);
                 if (d < bestD) {
                     bestD = d;
                     best = c;
                 }
             }
-            assignment[i] = best;
-            sizes[best]++;
+            coarseAssign[i] = best;
+            coarseSizes[best]++;
         }
 
-        postingStart = new int[effective + 1];
-        for (int c = 0; c < effective; c++) {
-            postingStart[c + 1] = postingStart[c] + sizes[c];
+        // 3. Agrupa os membros por cluster grosso (contíguo em coarseMembers).
+        int[] coarseStart = new int[coarseK + 1];
+        for (int c = 0; c < coarseK; c++) {
+            coarseStart[c + 1] = coarseStart[c] + coarseSizes[c];
+        }
+        int[] coarseMembers = new int[n];
+        int[] cursor = new int[coarseK];
+        for (int i = 0; i < n; i++) {
+            int c = coarseAssign[i];
+            coarseMembers[coarseStart[c] + cursor[c]++] = i;
+        }
+
+        // 4. Clusters finais: clusters pequenos passam direto; clusters acima de
+        //    MAX_CLUSTER_SIZE são divididos via sub-k-means; clusters vazios
+        //    somem. Cluster menor = bounding box mais justa = poda mais forte.
+        java.util.ArrayList<double[]> finalCentroids = new java.util.ArrayList<>(coarseK);
+        java.util.ArrayList<int[]> finalMembers = new java.util.ArrayList<>(coarseK);
+        int splitCount = 0;
+        for (int c = 0; c < coarseK; c++) {
+            int s = coarseStart[c];
+            int e = coarseStart[c + 1];
+            int size = e - s;
+            if (size == 0) continue;
+            if (size <= MAX_CLUSTER_SIZE) {
+                double[] ctr = new double[dim];
+                System.arraycopy(centroids, c * dim, ctr, 0, dim);
+                finalCentroids.add(ctr);
+                finalMembers.add(java.util.Arrays.copyOfRange(coarseMembers, s, e));
+            } else {
+                int subK = (size + MAX_CLUSTER_SIZE - 1) / MAX_CLUSTER_SIZE;
+                splitCluster(flat, dim, coarseMembers, s, e, subK, seed + c,
+                        finalCentroids, finalMembers);
+                splitCount++;
+            }
+        }
+
+        int k = finalCentroids.size();
+        System.out.println("[ivf] clusters: coarse=" + coarseK + " split=" + splitCount
+                + " final=" + k + " (max-cluster-size=" + MAX_CLUSTER_SIZE + ")");
+
+        // 5. Achata os clusters finais em centroids[] / postingStart[] /
+        //    postingList[] e calcula a bounding box de cada um.
+        centroids = new double[k * dim];
+        for (int c = 0; c < k; c++) {
+            System.arraycopy(finalCentroids.get(c), 0, centroids, c * dim, dim);
+        }
+        postingStart = new int[k + 1];
+        for (int c = 0; c < k; c++) {
+            postingStart[c + 1] = postingStart[c] + finalMembers.get(c).length;
         }
         int[] heapList = new int[n];
-        int[] cursor = new int[effective];
-        for (int i = 0; i < n; i++) {
-            int c = assignment[i];
-            heapList[postingStart[c] + cursor[c]++] = i;
+        bboxMin = new float[k * dim];
+        bboxMax = new float[k * dim];
+        java.util.Arrays.fill(bboxMin, Float.POSITIVE_INFINITY);
+        java.util.Arrays.fill(bboxMax, Float.NEGATIVE_INFINITY);
+        for (int c = 0; c < k; c++) {
+            int[] mem = finalMembers.get(c);
+            int base = postingStart[c];
+            int bbOff = c * dim;
+            for (int t = 0; t < mem.length; t++) {
+                int i = mem[t];
+                heapList[base + t] = i;
+                int srcOff = i * dim;
+                for (int d = 0; d < dim; d++) {
+                    float v = flat.get(srcOff + d);
+                    if (v < bboxMin[bbOff + d]) bboxMin[bbOff + d] = v;
+                    if (v > bboxMax[bbOff + d]) bboxMax[bbOff + d] = v;
+                }
+            }
         }
         postingList = IntBuffer.wrap(heapList);
 
-        // Bounding box por cluster: min/max de cada dimensão sobre os vetores
-        // atribuídos. Permite lower-bound rápida (distance até bbox) pra podar
-        // clusters inteiros no repair scan-all.
-        bboxMin = new float[effective * dim];
-        bboxMax = new float[effective * dim];
-        java.util.Arrays.fill(bboxMin, Float.POSITIVE_INFINITY);
-        java.util.Arrays.fill(bboxMax, Float.NEGATIVE_INFINITY);
-        for (int i = 0; i < n; i++) {
-            int c = assignment[i];
-            int srcOff = i * dim;
-            int dstOff = c * dim;
-            for (int d = 0; d < dim; d++) {
-                float v = flat.get(srcOff + d);
-                if (v < bboxMin[dstOff + d]) bboxMin[dstOff + d] = v;
-                if (v > bboxMax[dstOff + d]) bboxMax[dstOff + d] = v;
+        // 6. Quantiza linhas (ordem original — postingList mapeia) e bbox para
+        //    int16, deixando a busca in-memory pronta (dev-fallback).
+        int scale = ReferenceDataset.QUANT_SCALE;
+        short[] rowsArr = new short[n * dim];
+        for (int idx = 0; idx < n * dim; idx++) {
+            rowsArr[idx] = (short) Math.round(flat.get(idx) * scale);
+        }
+        rows = ShortBuffer.wrap(rowsArr);
+        quantizeBbox();
+    }
+
+    /**
+     * Divide um cluster grande em {@code subK} sub-clusters via k-means
+     * full-batch sobre os membros {@code members[from..to)}. Cada sub-cluster
+     * não-vazio vira um cluster final (centróide + lista de membros).
+     */
+    private void splitCluster(FloatBuffer flat, int dim,
+                              int[] members, int from, int to, int subK, long subSeed,
+                              java.util.ArrayList<double[]> outCentroids,
+                              java.util.ArrayList<int[]> outMembers) {
+        int size = to - from;
+        Random rnd = new Random(subSeed);
+        double[][] sub = new double[subK][dim];
+        for (int c = 0; c < subK; c++) {
+            int off = members[from + rnd.nextInt(size)] * dim;
+            for (int d = 0; d < dim; d++) sub[c][d] = flat.get(off + d);
+        }
+
+        int[] assign = new int[size];
+        double[][] sum = new double[subK][dim];
+        int[] cnt = new int[subK];
+        for (int iter = 0; iter < SPLIT_KMEANS_ITERATIONS; iter++) {
+            for (int t = 0; t < size; t++) {
+                int off = members[from + t] * dim;
+                int best = 0;
+                double bestD = Double.POSITIVE_INFINITY;
+                for (int c = 0; c < subK; c++) {
+                    double d = metric.distance(flat, off, sub[c], 0);
+                    if (d < bestD) { bestD = d; best = c; }
+                }
+                assign[t] = best;
             }
+            for (int c = 0; c < subK; c++) {
+                java.util.Arrays.fill(sum[c], 0.0);
+                cnt[c] = 0;
+            }
+            for (int t = 0; t < size; t++) {
+                int c = assign[t];
+                int off = members[from + t] * dim;
+                for (int d = 0; d < dim; d++) sum[c][d] += flat.get(off + d);
+                cnt[c]++;
+            }
+            for (int c = 0; c < subK; c++) {
+                if (cnt[c] > 0) {
+                    double inv = 1.0 / cnt[c];
+                    for (int d = 0; d < dim; d++) sub[c][d] = sum[c][d] * inv;
+                }
+            }
+        }
+
+        // Atribuição final + emissão dos sub-clusters não-vazios.
+        int[] subSizes = new int[subK];
+        for (int t = 0; t < size; t++) {
+            int off = members[from + t] * dim;
+            int best = 0;
+            double bestD = Double.POSITIVE_INFINITY;
+            for (int c = 0; c < subK; c++) {
+                double d = metric.distance(flat, off, sub[c], 0);
+                if (d < bestD) { bestD = d; best = c; }
+            }
+            assign[t] = best;
+            subSizes[best]++;
+        }
+        for (int c = 0; c < subK; c++) {
+            if (subSizes[c] == 0) continue;
+            int[] mem = new int[subSizes[c]];
+            int w = 0;
+            for (int t = 0; t < size; t++) {
+                if (assign[t] == c) mem[w++] = members[from + t];
+            }
+            outCentroids.add(sub[c]);
+            outMembers.add(mem);
         }
     }
 
@@ -234,49 +368,65 @@ public final class IvfVectorIndex implements VectorIndex {
                 + KMEANS_ITERATIONS + " iters, sample=" + sampleSize + ")");
     }
 
+    /** Quantiza a bbox float32 → int16 (×QUANT_SCALE). round recupera o inteiro exato. */
+    private void quantizeBbox() {
+        if (bboxMin == null || bboxMax == null) return;
+        int total = bboxMin.length;
+        int scale = ReferenceDataset.QUANT_SCALE;
+        bboxMinS = new short[total];
+        bboxMaxS = new short[total];
+        for (int i = 0; i < total; i++) {
+            bboxMinS[i] = (short) Math.round(bboxMin[i] * scale);
+            bboxMaxS[i] = (short) Math.round(bboxMax[i] * scale);
+        }
+    }
+
     @Override
     public void searchTopK(double[] query, int k, SearchResult out) {
-        if (dataset == null) throw new IllegalStateException("index not built");
+        if (rows == null) throw new IllegalStateException("index not built/loaded");
+        int dim = ReferenceDataset.DIM;
         int numC = postingStart.length - 1;
 
-        // 1. Top-nProbe centróides mais próximos.
+        // Query → int16 (×QUANT_SCALE). clamp01 já arredondou a 4 casas → exato.
+        short[] q16 = new short[dim];
+        int scale = ReferenceDataset.QUANT_SCALE;
+        for (int d = 0; d < dim; d++) {
+            q16[d] = (short) Math.round(query[d] * scale);
+        }
+
+        // 1. nProbe centróides mais próximos (double — seleção aproximada-OK,
+        //    o repair cobre o resto e torna o resultado exato).
         int probes = Math.min(nProbe, numC);
         int[] bestC = new int[probes];
         double[] bestCd = new double[probes];
         int filled = 0;
         double worst = Double.POSITIVE_INFINITY;
         for (int c = 0; c < numC; c++) {
-            double d = metric.distance(query, centroids, 0, c * ReferenceDataset.DIM);
+            double d = metric.distance(query, centroids, 0, c * dim);
             if (filled < probes) {
                 bestC[filled] = c;
                 bestCd[filled] = d;
                 filled++;
                 if (filled == probes) worst = maxOf(bestCd, probes);
             } else if (d < worst) {
-                int worstPos = 0;
+                int wp = 0;
                 double wv = bestCd[0];
                 for (int i = 1; i < probes; i++) {
-                    if (bestCd[i] > wv) { wv = bestCd[i]; worstPos = i; }
+                    if (bestCd[i] > wv) { wv = bestCd[i]; wp = i; }
                 }
-                bestC[worstPos] = c;
-                bestCd[worstPos] = d;
+                bestC[wp] = c;
+                bestCd[wp] = d;
                 worst = maxOf(bestCd, probes);
             }
         }
+        // Registra os clusters varridos — o repair os pula (sem dedup).
+        out.setProbedClusters(bestC, filled);
 
-        // 2. Varre as posting lists.
+        // 2. Varre as posting lists desses clusters (int16, acumulador long).
         int[] heapIdx = out.indices();
-        double[] heapDist = out.distances();
+        double[] heapDist = out.distances();   // guarda long-as-double
         int heapSize = 0;
-        double heapWorst = Double.POSITIVE_INFINITY;
-        FloatBuffer flat = dataset.flatFloats();
-        int dim = ReferenceDataset.DIM;
-        boolean es = earlyStop;
-        // Early-stop só vale após processar pelo menos metade dos probes —
-        // garante que tenha varrido clusters suficientes pro top-K refletir
-        // a vizinhança real e não só os 5 primeiros vetores do cluster mais
-        // próximo. Em K=5 + nProbe=2, isso ainda permite sair após o 1º cluster.
-        int esThreshold = Math.max(1, (filled + 1) / 2);
+        long heapWorst = Long.MAX_VALUE;
         for (int p = 0; p < filled; p++) {
             int c = bestC[p];
             int start = postingStart[c];
@@ -285,156 +435,152 @@ public final class IvfVectorIndex implements VectorIndex {
                 int i = postingList.get(j);
                 int off = i * dim;
                 if (heapSize < k) {
-                    // Heap ainda enchendo — sem cutoff, computa full distance.
-                    double d = metric.distance(query, flat, off);
+                    long d = l2sqInt(q16, off);
                     heapIdx[heapSize] = i;
                     heapDist[heapSize] = d;
                     heapSize++;
-                    if (heapSize == k) heapWorst = maxOf(heapDist, k);
+                    if (heapSize == k) heapWorst = maxLong(heapDist, k);
                 } else {
-                    // Heap cheio — early-exit se distância parcial já passa worst.
-                    double d = metric.distanceWithCutoff(query, flat, off, heapWorst);
+                    long d = l2sqIntCutoff(q16, off, heapWorst);
                     if (d >= heapWorst) continue;
-                    int worstPos = 0;
-                    double wv = heapDist[0];
+                    int wp = 0;
+                    long wv = (long) heapDist[0];
                     for (int q = 1; q < k; q++) {
-                        if (heapDist[q] > wv) { wv = heapDist[q]; worstPos = q; }
+                        long v = (long) heapDist[q];
+                        if (v > wv) { wv = v; wp = q; }
                     }
-                    heapIdx[worstPos] = i;
-                    heapDist[worstPos] = d;
-                    heapWorst = maxOf(heapDist, k);
+                    heapIdx[wp] = i;
+                    heapDist[wp] = d;
+                    heapWorst = maxLong(heapDist, k);
                 }
-            }
-            // Early-stop class-aware: top-K cheio + unanimidade → sai cedo.
-            // Aposta: se varremos clusters suficientes e todos os top-K caem
-            // na mesma classe, é improvável que clusters mais distantes
-            // tragam vetor mais próximo da classe oposta. Salva CPU sem
-            // mudar a decisão final na maioria dos casos.
-            if (es && heapSize == k && (p + 1) >= esThreshold
-                    && unanimousClass(heapIdx, heapSize, dataset)) {
-                break;
             }
         }
 
-        sortAscending(heapIdx, heapDist, heapSize);
+        sortAscendingLong(heapIdx, heapDist, heapSize);
         out.setSize(heapSize);
     }
 
-    private static boolean unanimousClass(int[] idx, int size, ReferenceDataset ds) {
-        boolean first = ds.isFraud(idx[0]);
-        for (int q = 1; q < size; q++) {
-            if (ds.isFraud(idx[q]) != first) return false;
-        }
-        return true;
-    }
-
     /**
-     * Repair: dado um {@link SearchResult} já preenchido (seed da fast pass),
-     * varre TODOS os clusters podando por lower-bound em bbox. Refina o top-K
-     * só com candidatos cuja bbox-distance é menor que o pior atual.
-     *
-     * Truque dos top-5 da Rinha (silent-index, rinha-fraud-cpp): a bbox prune
-     * faz "brute force scan-all" custar quase nada na prática — quase todos os
-     * clusters falham o teste após o fast pass tigthtened o cutoff. Só os
-     * clusters com algum vetor potencialmente competitivo entram no SIMD loop.
-     *
-     * Premissa: bbox-distance euclidiana faz sentido como lower-bound só pra
-     * métricas Euclidean-like. Para Manhattan/Cosine o resultado é over-estimate
-     * — não quebra correctness, só não aproveita o prune.
+     * Repair: dado um {@link SearchResult} já preenchido pela fast pass, varre
+     * todos os clusters NÃO varridos por ela, podando por lower-bound de bbox.
+     * Como os clusters da fast pass são pulados, cada vetor é visto uma vez só
+     * — sem dedup. O resultado é o top-K exato.
      */
     public void scanAllWithBboxPrune(double[] query, int k, SearchResult inOut) {
-        if (bboxMin == null || bboxMax == null) {
-            throw new IllegalStateException("scanAllWithBboxPrune requires bbox built/loaded");
+        if (rows == null || bboxMinS == null) {
+            throw new IllegalStateException("scanAllWithBboxPrune requires built/loaded index");
         }
+        int dim = ReferenceDataset.DIM;
         int numC = postingStart.length - 1;
+
+        short[] q16 = new short[dim];
+        int scale = ReferenceDataset.QUANT_SCALE;
+        for (int d = 0; d < dim; d++) {
+            q16[d] = (short) Math.round(query[d] * scale);
+        }
+
+        int[] probed = inOut.probedClusters();
+        int probedCount = inOut.probedCount();
+
         int[] heapIdx = inOut.indices();
         double[] heapDist = inOut.distances();
         int heapSize = inOut.size();
-        double heapWorst = heapSize >= k ? maxOf(heapDist, k) : Double.POSITIVE_INFINITY;
-        FloatBuffer flat = dataset.flatFloats();
-        int dim = ReferenceDataset.DIM;
+        long heapWorst = heapSize >= k ? maxLong(heapDist, k) : Long.MAX_VALUE;
 
         for (int c = 0; c < numC; c++) {
-            double bbLow = bboxLowerBoundSq(query, c * dim, dim);
+            // Pula os clusters já varridos pela fast pass.
+            boolean skip = false;
+            for (int p = 0; p < probedCount; p++) {
+                if (probed[p] == c) { skip = true; break; }
+            }
+            if (skip) continue;
+
+            // Lower-bound da bbox com early-exit: aborta a soma quando já passa
+            // do pior do heap — a maioria dos clusters morre nas primeiras dims.
+            long bbLow = bboxLowerBoundInt(q16, c * dim, heapWorst);
             if (bbLow >= heapWorst) continue;
 
             int start = postingStart[c];
             int end = postingStart[c + 1];
             for (int j = start; j < end; j++) {
                 int i = postingList.get(j);
-                // Dedup: vetores do cluster podem já estar no heap (vindo da
-                // fast pass se este cluster foi probado). Inserir duplicado
-                // bagunça o countFrauds depois — então pula.
-                boolean dup = false;
-                for (int q = 0; q < heapSize; q++) {
-                    if (heapIdx[q] == i) { dup = true; break; }
-                }
-                if (dup) continue;
                 int off = i * dim;
                 if (heapSize < k) {
-                    double d = metric.distance(query, flat, off);
+                    long d = l2sqInt(q16, off);
                     heapIdx[heapSize] = i;
                     heapDist[heapSize] = d;
                     heapSize++;
-                    if (heapSize == k) heapWorst = maxOf(heapDist, k);
+                    if (heapSize == k) heapWorst = maxLong(heapDist, k);
                 } else {
-                    double d = metric.distanceWithCutoff(query, flat, off, heapWorst);
+                    long d = l2sqIntCutoff(q16, off, heapWorst);
                     if (d >= heapWorst) continue;
-                    int worstPos = 0;
-                    double wv = heapDist[0];
+                    int wp = 0;
+                    long wv = (long) heapDist[0];
                     for (int q = 1; q < k; q++) {
-                        if (heapDist[q] > wv) { wv = heapDist[q]; worstPos = q; }
+                        long v = (long) heapDist[q];
+                        if (v > wv) { wv = v; wp = q; }
                     }
-                    heapIdx[worstPos] = i;
-                    heapDist[worstPos] = d;
-                    heapWorst = maxOf(heapDist, k);
+                    heapIdx[wp] = i;
+                    heapDist[wp] = d;
+                    heapWorst = maxLong(heapDist, k);
                 }
             }
         }
 
-        sortAscending(heapIdx, heapDist, heapSize);
+        sortAscendingLong(heapIdx, heapDist, heapSize);
         inOut.setSize(heapSize);
     }
 
-    /**
-     * Squared Euclidean lower-bound: distância do query até o ponto mais
-     * próximo da bbox. Em cada dim, contribui (q-min)^2 se q<min, (q-max)^2
-     * se q>max, 0 se dentro do intervalo.
-     */
-    private double bboxLowerBoundSq(double[] query, int off, int dim) {
-        double sum = 0.0;
-        for (int d = 0; d < dim; d++) {
-            double q = query[d];
-            float lo = bboxMin[off + d];
-            float hi = bboxMax[off + d];
-            if (q < lo) {
-                double diff = lo - q;
-                sum += diff * diff;
-            } else if (q > hi) {
-                double diff = q - hi;
-                sum += diff * diff;
-            }
+    /** L2² inteira entre query int16 e a linha em {@code rows[off..off+13]}. */
+    private long l2sqInt(short[] q16, int off) {
+        long sum = 0;
+        for (int d = 0; d < ReferenceDataset.DIM; d++) {
+            int diff = q16[d] - rows.get(off + d);
+            sum += (long) diff * diff;
+        }
+        return sum;
+    }
+
+    /** Variante com early-exit: aborta após 8 dims se a parcial já ≥ cutoff. */
+    private long l2sqIntCutoff(short[] q16, int off, long cutoff) {
+        long sum = 0;
+        for (int d = 0; d < 8; d++) {
+            int diff = q16[d] - rows.get(off + d);
+            sum += (long) diff * diff;
+        }
+        if (sum >= cutoff) return sum;
+        for (int d = 8; d < ReferenceDataset.DIM; d++) {
+            int diff = q16[d] - rows.get(off + d);
+            sum += (long) diff * diff;
         }
         return sum;
     }
 
     /**
-     * Salva o índice construído em {@code path} no formato .idx binário.
-     *
-     * Layout (little-endian):
-     *   Header (32 bytes):
-     *     0-3   : magic "RVII"
-     *     4-7   : version (uint32) + reserved
-     *     8-11  : numCentroids (uint32)
-     *     12-15 : dim (uint32)
-     *     16-19 : numVectors (uint32)
-     *     20-31 : reserved
-     *   centroids:    numCentroids * dim * float32 (LE) — downcast de double.
-     *   postingStart: (numCentroids+1) * int32 (LE)
-     *   postingList:  numVectors * int32 (LE)
-     *
-     * Centróides são gravados como float32 (precisão suficiente; metade do tamanho
-     * vs double). Promovidos pra double[] no load.
+     * Lower-bound inteiro: L2² do query até o ponto mais próximo da bbox do
+     * cluster. Early-exit — retorna assim que a soma parcial atinge {@code limit}.
+     */
+    private long bboxLowerBoundInt(short[] q16, int off, long limit) {
+        long sum = 0;
+        for (int d = 0; d < ReferenceDataset.DIM; d++) {
+            int q = q16[d];
+            int lo = bboxMinS[off + d];
+            int hi = bboxMaxS[off + d];
+            if (q < lo) {
+                int df = lo - q;
+                sum += (long) df * df;
+            } else if (q > hi) {
+                int df = q - hi;
+                sum += (long) df * df;
+            }
+            if (sum >= limit) return sum;
+        }
+        return sum;
+    }
+
+    /**
+     * Salva o índice no formato .idx v2 (legado — só o caminho dev de build
+     * in-memory + persist). O caminho de produção usa {@link #writeClusteredArtifacts}.
      */
     public void save(Path path) throws IOException {
         if (dataset == null || centroids == null || postingStart == null || postingList == null) {
@@ -454,10 +600,8 @@ public final class IvfVectorIndex implements VectorIndex {
             header.putInt(k);
             header.putInt(dim);
             header.putInt(n);
-            // 12 bytes reservados — zeros.
             out.write(header.array());
 
-            // centroids: float32 chunks.
             int chunkFloats = 1024;
             ByteBuffer fbuf = ByteBuffer.allocate(chunkFloats * 4).order(ByteOrder.LITTLE_ENDIAN);
             int totalF = k * dim;
@@ -472,12 +616,10 @@ public final class IvfVectorIndex implements VectorIndex {
                 writtenF += take;
             }
 
-            // postingStart: int32.
             ByteBuffer ibuf = ByteBuffer.allocate((k + 1) * 4).order(ByteOrder.LITTLE_ENDIAN);
             for (int i = 0; i <= k; i++) ibuf.putInt(postingStart[i]);
             out.write(ibuf.array());
 
-            // postingList: int32 chunks.
             int chunkInts = 4096;
             ByteBuffer lbuf = ByteBuffer.allocate(chunkInts * 4).order(ByteOrder.LITTLE_ENDIAN);
             int writtenL = 0;
@@ -491,7 +633,6 @@ public final class IvfVectorIndex implements VectorIndex {
                 writtenL += take;
             }
 
-            // bboxMin + bboxMax: cada um k*dim floats LE (~230 KB pra k=4096).
             ByteBuffer bbBuf = ByteBuffer.allocate(k * dim * 4).order(ByteOrder.LITTLE_ENDIAN);
             for (int i = 0; i < k * dim; i++) bbBuf.putFloat(bboxMin[i]);
             out.write(bbBuf.array());
@@ -502,20 +643,139 @@ public final class IvfVectorIndex implements VectorIndex {
     }
 
     /**
-     * Carrega um índice .idx via mmap. centroids + postingStart vão pra heap
-     * (pequenos: ~475 KB juntos); postingList vira IntBuffer direto sobre o
-     * arquivo mapeado — duas instâncias compartilham essas páginas via page
-     * cache.
+     * Escreve os artefatos no layout CLUSTERED: o dataset {@code .bin} com as
+     * linhas reordenadas por cluster — cluster c ocupa as linhas contíguas
+     * {@code [postingStart[c], postingStart[c+1])} — gravadas em int16
+     * (×QUANT_SCALE), e o {@code .idx} v2 com a posting list = identidade.
+     *
+     * Linhas contíguas → varredura de cluster sequencial. int16 → metade dos
+     * bytes no scan memory-bound do repair. É uma permutação + quantização
+     * lossless: mesmas distâncias relativas, mesmo top-K. Os labels são
+     * reordenados na mesma permutação → contagem de fraude idêntica.
+     */
+    public void writeClusteredArtifacts(ReferenceDataset original,
+                                        Path idxPath, Path clusteredBinPath) throws IOException {
+        if (dataset == null || centroids == null || postingStart == null || postingList == null) {
+            throw new IllegalStateException("writeClusteredArtifacts requires build() first");
+        }
+        int k = numCentroids();
+        int dim = ReferenceDataset.DIM;
+        int n = original.size();
+        if (n != dataset.size()) {
+            throw new IllegalStateException("original size " + n
+                    + " != built dataset size " + dataset.size());
+        }
+        int scale = ReferenceDataset.QUANT_SCALE;
+
+        // ---- 1. dataset .bin reordenado por cluster + quantizado int16 ----
+        if (clusteredBinPath.toAbsolutePath().getParent() != null) {
+            Files.createDirectories(clusteredBinPath.toAbsolutePath().getParent());
+        }
+        FloatBuffer srcFlat = original.flatFloats();
+        byte[] srcLabels = original.labels();
+        try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(
+                clusteredBinPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))) {
+
+            ByteBuffer hdr = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+            hdr.put((byte) 'R'); hdr.put((byte) 'N'); hdr.put((byte) 'H'); hdr.put((byte) 'A');
+            hdr.put((byte) 2);     // version 2
+            hdr.put((byte) dim);   // dim
+            hdr.put((byte) 1);     // dtype int16
+            hdr.put((byte) 0);     // flags
+            hdr.putInt(n);
+            hdr.putInt(0);
+            out.write(hdr.array());
+
+            // linhas int16: linha p = quantize(vetor original postingList[p]).
+            int rowsPerChunk = 512;
+            ByteBuffer sb = ByteBuffer.allocate(rowsPerChunk * dim * 2).order(ByteOrder.LITTLE_ENDIAN);
+            for (int p = 0; p < n; ) {
+                int take = Math.min(rowsPerChunk, n - p);
+                sb.clear();
+                for (int r = 0; r < take; r++) {
+                    int srcOff = postingList.get(p + r) * dim;
+                    for (int d = 0; d < dim; d++) {
+                        sb.putShort((short) Math.round(srcFlat.get(srcOff + d) * scale));
+                    }
+                }
+                out.write(sb.array(), 0, take * dim * 2);
+                p += take;
+            }
+
+            // labels: mesma permutação das linhas.
+            byte[] lb = new byte[4096];
+            for (int p = 0; p < n; ) {
+                int take = Math.min(lb.length, n - p);
+                for (int r = 0; r < take; r++) {
+                    lb[r] = srcLabels[postingList.get(p + r)];
+                }
+                out.write(lb, 0, take);
+                p += take;
+            }
+        }
+
+        // ---- 2. .idx v2 com posting list = identidade ----
+        if (idxPath.toAbsolutePath().getParent() != null) {
+            Files.createDirectories(idxPath.toAbsolutePath().getParent());
+        }
+        try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(
+                idxPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))) {
+
+            ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            header.putInt(MAGIC);
+            header.putInt(VERSION);
+            header.putInt(k);
+            header.putInt(dim);
+            header.putInt(n);
+            out.write(header.array());
+
+            int chunkFloats = 1024;
+            ByteBuffer cb = ByteBuffer.allocate(chunkFloats * 4).order(ByteOrder.LITTLE_ENDIAN);
+            int totalF = k * dim;
+            int writtenF = 0;
+            while (writtenF < totalF) {
+                int take = Math.min(chunkFloats, totalF - writtenF);
+                cb.clear();
+                for (int i = 0; i < take; i++) cb.putFloat((float) centroids[writtenF + i]);
+                out.write(cb.array(), 0, take * 4);
+                writtenF += take;
+            }
+
+            ByteBuffer ps = ByteBuffer.allocate((k + 1) * 4).order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i <= k; i++) ps.putInt(postingStart[i]);
+            out.write(ps.array());
+
+            // posting list = identidade (0,1,2,...,n-1) — dataset já reordenado.
+            int chunkInts = 4096;
+            ByteBuffer pl = ByteBuffer.allocate(chunkInts * 4).order(ByteOrder.LITTLE_ENDIAN);
+            int writtenL = 0;
+            while (writtenL < n) {
+                int take = Math.min(chunkInts, n - writtenL);
+                pl.clear();
+                for (int i = 0; i < take; i++) pl.putInt(writtenL + i);
+                out.write(pl.array(), 0, take * 4);
+                writtenL += take;
+            }
+
+            ByteBuffer bb = ByteBuffer.allocate(k * dim * 4).order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < k * dim; i++) bb.putFloat(bboxMin[i]);
+            out.write(bb.array());
+            bb.clear();
+            for (int i = 0; i < k * dim; i++) bb.putFloat(bboxMax[i]);
+            out.write(bb.array());
+        }
+    }
+
+    /**
+     * Carrega um índice .idx via mmap. O {@code dataset} deve ser o .bin
+     * clustered int16 (linhas já em ordem de cluster). centroids + postingStart
+     * + bbox vão pra heap; postingList vira IntBuffer direto sobre o arquivo.
      */
     public static IvfVectorIndex loadMmap(DistanceMetric metric, int nProbe,
                                           Path path, ReferenceDataset dataset) throws IOException {
         return loadMmap(metric, nProbe, path, dataset, false, false);
     }
 
-    /**
-     * Variante com hints. {@code prefetch=true} pre-fault todas as páginas
-     * (kernel paga page cache). {@code hugepage=true} pede MADV_HUGEPAGE.
-     */
     public static IvfVectorIndex loadMmap(DistanceMetric metric, int nProbe,
                                           Path path, ReferenceDataset dataset,
                                           boolean prefetch, boolean hugepage) throws IOException {
@@ -567,7 +827,6 @@ public final class IvfVectorIndex implements VectorIndex {
                 throw new IOException(".idx truncated: have " + fileSize + ", expected " + expected);
             }
 
-            // centroids: float32 no disco -> double[] em memória (459 KB pra k=4096).
             double[] centroids = new double[k * dim];
             mapped.position(HEADER_BYTES);
             ByteBuffer centroidsRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
@@ -577,7 +836,6 @@ public final class IvfVectorIndex implements VectorIndex {
                 centroids[i] = centroidsFB.get(i);
             }
 
-            // postingStart: int32 no disco -> int[] em memória (16 KB).
             int[] postingStart = new int[k + 1];
             mapped.position(HEADER_BYTES + (int) centroidsBytes);
             ByteBuffer psRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
@@ -587,14 +845,12 @@ public final class IvfVectorIndex implements VectorIndex {
                 postingStart[i] = psIB.get(i);
             }
 
-            // postingList: int32 no disco, mmap direto via IntBuffer (12 MB).
             int plStart = HEADER_BYTES + (int) centroidsBytes + (int) postingStartBytes;
             mapped.position(plStart);
             ByteBuffer plRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
             plRegion.limit((int) postingListBytes);
             IntBuffer postingList = plRegion.asIntBuffer();
 
-            // bboxMin + bboxMax: float32 -> heap float[] (~460 KB total).
             int bbMinStart = plStart + (int) postingListBytes;
             int bbMaxStart = bbMinStart + (int) bboxBytes;
             float[] bboxMin = new float[k * dim];
@@ -626,17 +882,27 @@ public final class IvfVectorIndex implements VectorIndex {
         return m;
     }
 
-    private static void sortAscending(int[] idxArr, double[] distArr, int size) {
+    private static long maxLong(double[] a, int size) {
+        long m = (long) a[0];
         for (int i = 1; i < size; i++) {
-            double d = distArr[i];
+            long v = (long) a[i];
+            if (v > m) m = v;
+        }
+        return m;
+    }
+
+    /** Insertion sort por distância ascendente (distâncias guardadas como long-as-double). */
+    private static void sortAscendingLong(int[] idxArr, double[] distArr, int size) {
+        for (int i = 1; i < size; i++) {
+            long dv = (long) distArr[i];
             int ix = idxArr[i];
             int j = i - 1;
-            while (j >= 0 && distArr[j] > d) {
+            while (j >= 0 && (long) distArr[j] > dv) {
                 distArr[j + 1] = distArr[j];
                 idxArr[j + 1] = idxArr[j];
                 j--;
             }
-            distArr[j + 1] = d;
+            distArr[j + 1] = dv;
             idxArr[j + 1] = ix;
         }
     }

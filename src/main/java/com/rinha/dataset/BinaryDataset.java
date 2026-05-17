@@ -43,6 +43,8 @@ public final class BinaryDataset {
     public static final int HEADER_BYTES = 16;
     public static final byte VERSION = 2;
     public static final byte DTYPE_FLOAT32 = 0;
+    /** dtype int16: vetores gravados como short ×ReferenceDataset.QUANT_SCALE. */
+    public static final byte DTYPE_INT16 = 1;
     private static final int DIM = ReferenceDataset.DIM;
     private static final int FLOATS_PER_CHUNK = 64 * DIM;        // 64 vetores
     private static final int LABEL_CHUNK_BYTES = 4096;
@@ -89,6 +91,11 @@ public final class BinaryDataset {
     public static ReferenceDataset read(InputStream in) throws IOException {
         byte[] header = in.readNBytes(HEADER_BYTES);
         int count = validateHeader(header);
+        if ((header[6] & 0xff) == DTYPE_INT16) {
+            // Caminho streaming-heap só suporta float32. O .bin int16 (dataset
+            // clustered) é sempre carregado via mmap em runtime.
+            throw new IOException("int16 .bin requires mmap (MMAP=true)");
+        }
         long flatLen = (long) count * DIM;
         if (flatLen > Integer.MAX_VALUE) {
             throw new IOException("Dataset too large: " + count + " records");
@@ -171,25 +178,29 @@ public final class BinaryDataset {
             byte[] header = new byte[HEADER_BYTES];
             mapped.get(0, header);
             int count = validateHeader(header);
-            long flatBytes = (long) count * DIM * 4;
+            int dtype = header[6] & 0xff;
+            int elemBytes = (dtype == DTYPE_INT16) ? 2 : 4;
+            long flatBytes = (long) count * DIM * elemBytes;
             long expectedSize = HEADER_BYTES + flatBytes + count;
             if (fileSize < expectedSize) {
                 throw new IOException(".bin truncated: have " + fileSize
                         + ", expected " + expectedSize);
             }
 
-            // Fatia a região de floats como FloatBuffer.
+            // Fatia a região de vetores (float32 ou int16) sobre o arquivo.
             mapped.position(HEADER_BYTES);
-            ByteBuffer floatsRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            floatsRegion.limit((int) flatBytes);
-            FloatBuffer floats = floatsRegion.asFloatBuffer();
+            ByteBuffer flatRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
+            flatRegion.limit((int) flatBytes);
 
-            // Labels: 3 MB, copia pra heap.
+            // Labels: ~3 MB, copia pra heap.
             mapped.position(HEADER_BYTES + (int) flatBytes);
             byte[] labels = new byte[count];
             mapped.get(labels, 0, count);
 
-            return new ReferenceDataset(floats, labels, count);
+            if (dtype == DTYPE_INT16) {
+                return ReferenceDataset.quantized(flatRegion.asShortBuffer(), labels, count);
+            }
+            return new ReferenceDataset(flatRegion.asFloatBuffer(), labels, count);
         }
     }
 
@@ -209,7 +220,7 @@ public final class BinaryDataset {
             throw new IOException("Dim mismatch: expected " + DIM + ", got " + dim);
         }
         int dtype = header[6] & 0xff;
-        if (dtype != DTYPE_FLOAT32) {
+        if (dtype != DTYPE_FLOAT32 && dtype != DTYPE_INT16) {
             throw new IOException("Unsupported dtype: " + dtype);
         }
         int count = (header[8] & 0xff)

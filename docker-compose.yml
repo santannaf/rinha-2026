@@ -18,13 +18,13 @@ services:
     environment:
       HTTP_SERVER: "NIO"
       UDS_PATH: /sockets/api1.sock
-      DATASET_PATH: /resources/references.bin
+      DATASET_PATH: /resources/references-clustered.bin
       IVF_INDEX_PATH: /resources/references.idx
       VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
       QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
       IVF_CENTROIDS: "4096"
       IVF_NPROBE: "${IVF_NPROBE:-2}"
-      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
       PERF_LOG: "${PERF_LOG:-false}"
       MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
@@ -45,13 +45,13 @@ services:
     environment:
       HTTP_SERVER: "NIO"
       UDS_PATH: /sockets/api2.sock
-      DATASET_PATH: /resources/references.bin
+      DATASET_PATH: /resources/references-clustered.bin
       IVF_INDEX_PATH: /resources/references.idx
       VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
       QBIN_PATH: "${QBIN_PATH:-/resources/references.qbin}"
       IVF_CENTROIDS: "4096"
       IVF_NPROBE: "${IVF_NPROBE:-2}"
-      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-false}"
+      BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
       PERF_LOG: "${PERF_LOG:-false}"
       MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
