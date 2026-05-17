@@ -75,6 +75,11 @@ public final class IvfVectorIndex implements VectorIndex {
     // com repair em toda request o early-stop seria inseguro (deixaria
     // clusters não varridos quando o repair pula os "probados").
     private volatile boolean earlyStop = false;
+    // No layout CLUSTERED a posting list é a identidade (0..n-1) — o .bin já
+    // está reordenado por cluster. Quando true, o scan usa o índice direto e
+    // pula a leitura da região mmap da posting list (~12 MB), cortando ~1/8 do
+    // tráfego de memória de um scan que é memory-bound.
+    private boolean identityPostings = false;
 
     public IvfVectorIndex(DistanceMetric metric, int numCentroids, int nProbe, long seed) {
         this.metric = metric;
@@ -102,6 +107,7 @@ public final class IvfVectorIndex implements VectorIndex {
         this.bboxMin = bboxMin;
         this.bboxMax = bboxMax;
         this.rows = dataset.quantized() ? dataset.flatShorts() : null;
+        this.identityPostings = isIdentity(postingList);
         quantizeBbox();
     }
 
@@ -232,6 +238,7 @@ public final class IvfVectorIndex implements VectorIndex {
             }
         }
         postingList = IntBuffer.wrap(heapList);
+        identityPostings = isIdentity(postingList);
 
         // 6. Quantiza linhas (ordem original — postingList mapeia) e bbox para
         //    int16, deixando a busca in-memory pronta (dev-fallback).
@@ -388,17 +395,18 @@ public final class IvfVectorIndex implements VectorIndex {
         int numC = postingStart.length - 1;
 
         // Query → int16 (×QUANT_SCALE). clamp01 já arredondou a 4 casas → exato.
-        short[] q16 = new short[dim];
+        short[] q16 = out.q16();
         int scale = ReferenceDataset.QUANT_SCALE;
         for (int d = 0; d < dim; d++) {
             q16[d] = (short) Math.round(query[d] * scale);
         }
 
         // 1. nProbe centróides mais próximos (double — seleção aproximada-OK,
-        //    o repair cobre o resto e torna o resultado exato).
-        int probes = Math.min(nProbe, numC);
-        int[] bestC = new int[probes];
-        double[] bestCd = new double[probes];
+        //    o repair cobre o resto e torna o resultado exato). bestC/bestCd
+        //    reusam os buffers scratch da SearchResult — zero alocação.
+        int[] bestC = out.probedClusters();
+        double[] bestCd = out.probeDist();
+        int probes = Math.min(Math.min(nProbe, numC), bestC.length);
         int filled = 0;
         double worst = Double.POSITIVE_INFINITY;
         for (int c = 0; c < numC; c++) {
@@ -420,7 +428,8 @@ public final class IvfVectorIndex implements VectorIndex {
             }
         }
         // Registra os clusters varridos — o repair os pula (sem dedup).
-        out.setProbedClusters(bestC, filled);
+        // bestC já É out.probedClusters() (scratch preenchido in-place, sem cópia).
+        out.setProbedCount(filled);
 
         // 2. Varre as posting lists desses clusters (int16, acumulador long).
         int[] heapIdx = out.indices();
@@ -432,7 +441,7 @@ public final class IvfVectorIndex implements VectorIndex {
             int start = postingStart[c];
             int end = postingStart[c + 1];
             for (int j = start; j < end; j++) {
-                int i = postingList.get(j);
+                int i = identityPostings ? j : postingList.get(j);
                 int off = i * dim;
                 if (heapSize < k) {
                     long d = l2sqInt(q16, off);
@@ -473,7 +482,7 @@ public final class IvfVectorIndex implements VectorIndex {
         int dim = ReferenceDataset.DIM;
         int numC = postingStart.length - 1;
 
-        short[] q16 = new short[dim];
+        short[] q16 = inOut.q16();
         int scale = ReferenceDataset.QUANT_SCALE;
         for (int d = 0; d < dim; d++) {
             q16[d] = (short) Math.round(query[d] * scale);
@@ -503,7 +512,7 @@ public final class IvfVectorIndex implements VectorIndex {
             int start = postingStart[c];
             int end = postingStart[c + 1];
             for (int j = start; j < end; j++) {
-                int i = postingList.get(j);
+                int i = identityPostings ? j : postingList.get(j);
                 int off = i * dim;
                 if (heapSize < k) {
                     long d = l2sqInt(q16, off);
@@ -874,6 +883,15 @@ public final class IvfVectorIndex implements VectorIndex {
 
     private int numCentroids() {
         return postingStart.length - 1;
+    }
+
+    /** true se postingList[j] == j para todo j — layout clustered. Roda 1× no startup. */
+    private static boolean isIdentity(IntBuffer pl) {
+        int n = pl.limit();
+        for (int j = 0; j < n; j++) {
+            if (pl.get(j) != j) return false;
+        }
+        return true;
     }
 
     private static double maxOf(double[] a, int size) {
