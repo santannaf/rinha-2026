@@ -43,16 +43,16 @@ tasks.register('analyzeFailures', JavaExec) {
 
 tasks.register('buildIvfIndex', JavaExec) {
     group = 'application'
-    description = 'Constrói o IVF index e salva em .idx pra mmap-load no startup.'
+    description = 'Constrói o IVF index (.idx) + dataset clustered (.bin) pra mmap-load no startup.'
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'com.rinha.tools.BuildIvfIndex'
     jvmArgs = ['--add-modules=jdk.incubator.vector']
-    args = ['resources/references.idx']
+    args = ['resources/references.idx', 'resources/references-clustered.bin']
     def datasetIn = System.getenv('DATASET_PATH') ?: 'resources/references.bin'
-    def idxOut = 'resources/references.idx'
     environment 'DATASET_PATH', datasetIn
     inputs.file(datasetIn)
-    outputs.file(idxOut)
+    outputs.file('resources/references.idx')
+    outputs.file('resources/references-clustered.bin')
 }
 
 tasks.register('buildQuantizedDataset', JavaExec) {

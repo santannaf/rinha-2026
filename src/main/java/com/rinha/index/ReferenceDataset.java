@@ -1,38 +1,41 @@
 package com.rinha.index;
 
 import java.nio.FloatBuffer;
+import java.nio.ShortBuffer;
 
 /**
  * Dataset rotulado em layout flat. Para N vetores de DIM dimensões:
- *   flatFloats.get(i * DIM + d) = i-ésimo vetor, dimensão d (precisão float32)
+ *   flatFloats.get(i*DIM+d)  — vetor i, dim d (float32), OU
+ *   flatShorts.get(i*DIM+d)  — vetor i, dim d (int16, ×QUANT_SCALE)
  *   labels[i] = 0 (legit) | 1 (fraud)
  *
- * Storage abstrai duas origens:
- *  1. Heap-backed ({@link FloatBuffer#wrap(float[])}) — usado pelo loader
- *     streaming JSON e pelo gerador sintético; conta como heap anônimo.
- *  2. Direct/mapped — {@code FileChannel.map} de um arquivo {@code .bin} v2.
- *     Páginas físicas vivem no page cache do kernel e podem ser compartilhadas
- *     entre containers (mesma inode → mesma página física), permitindo dois
- *     backends caberem em 350 MiB sem duplicar os 168 MiB do dataset.
+ * Duas representações dos vetores:
+ *  - float32: usada na construção do índice (k-means precisa de precisão) e
+ *    pelo dataset sintético/dev.
+ *  - int16 (×10000): usada em runtime — o dataset clustered é gravado
+ *    quantizado. Metade dos bytes → metade do tráfego de memória no scan do
+ *    repair (que é memory-bound). Lossless: as referências já estão na grade
+ *    de 1/10000, então valor × 10000 dá inteiro exato.
  *
- * Os 3 MB de {@code labels} ficam sempre em heap byte[] (não vale o esforço de
- * mmap-ar pra ganhar 3 MB compartilhados, e bytes não têm endianness).
+ * Só uma das duas é não-nula; {@link #quantized()} diz qual.
  *
- * O query do request continua sendo {@code double[14]} (pequeno, por request).
- * As métricas de distância widenam float→double por dim no hot path.
+ * Os labels ficam sempre em heap byte[] (~3 MB; bytes não têm endianness).
  */
 public final class ReferenceDataset {
 
     public static final int DIM = 14;
     public static final byte LABEL_LEGIT = 0;
     public static final byte LABEL_FRAUD = 1;
+    /** Escala de quantização int16: valor_real × QUANT_SCALE = inteiro exato. */
+    public static final int QUANT_SCALE = 10000;
 
-    private final FloatBuffer flatFloats;
+    private final FloatBuffer flatFloats;   // não-nulo no modo float32
+    private final ShortBuffer flatShorts;   // não-nulo no modo int16
     private final byte[] labels;
     private final int size;
 
     /**
-     * Construtor genérico. O buffer precisa cobrir pelo menos {@code size * DIM}
+     * Construtor float32. O buffer precisa cobrir pelo menos {@code size*DIM}
      * floats e estar em little-endian quando vier de bytes externos.
      */
     public ReferenceDataset(FloatBuffer flatFloats, byte[] labels, int size) {
@@ -45,6 +48,7 @@ public final class ReferenceDataset {
             throw new IllegalArgumentException("labels too small");
         }
         this.flatFloats = flatFloats;
+        this.flatShorts = null;
         this.labels = labels;
         this.size = size;
     }
@@ -54,12 +58,42 @@ public final class ReferenceDataset {
         this(FloatBuffer.wrap(flat), labels, size);
     }
 
+    private ReferenceDataset(ShortBuffer flatShorts, byte[] labels, int size) {
+        if (flatShorts.capacity() < (long) size * DIM) {
+            throw new IllegalArgumentException("flatShorts too small: capacity="
+                    + flatShorts.capacity() + ", need " + (long) size * DIM);
+        }
+        if (labels.length < size) {
+            throw new IllegalArgumentException("labels too small");
+        }
+        this.flatFloats = null;
+        this.flatShorts = flatShorts;
+        this.labels = labels;
+        this.size = size;
+    }
+
+    /** Cria um dataset no modo int16 (vetores já quantizados ×QUANT_SCALE). */
+    public static ReferenceDataset quantized(ShortBuffer flatShorts, byte[] labels, int size) {
+        return new ReferenceDataset(flatShorts, labels, size);
+    }
+
     public int size() {
         return size;
     }
 
+    /** true se os vetores estão em int16 (×QUANT_SCALE); false se float32. */
+    public boolean quantized() {
+        return flatShorts != null;
+    }
+
+    /** Buffer float32 — {@code null} no modo int16. */
     public FloatBuffer flatFloats() {
         return flatFloats;
+    }
+
+    /** Buffer int16 (×QUANT_SCALE) — {@code null} no modo float32. */
+    public ShortBuffer flatShorts() {
+        return flatShorts;
     }
 
     public byte[] labels() {
@@ -79,13 +113,19 @@ public final class ReferenceDataset {
     }
 
     /**
-     * Copia o i-ésimo vetor para um buffer auxiliar, widening float→double.
-     * Útil em warmup e testes — não usar no hot path da busca.
+     * Copia o vetor {@code index} para {@code out} em escala real [0,1]
+     * (dequantiza se int16). Útil em warmup e testes — não no hot path.
      */
     public void copyVector(int index, double[] out) {
         int off = index * DIM;
-        for (int d = 0; d < DIM; d++) {
-            out[d] = flatFloats.get(off + d);
+        if (flatShorts != null) {
+            for (int d = 0; d < DIM; d++) {
+                out[d] = flatShorts.get(off + d) / (double) QUANT_SCALE;
+            }
+        } else {
+            for (int d = 0; d < DIM; d++) {
+                out[d] = flatFloats.get(off + d);
+            }
         }
     }
 }

@@ -29,11 +29,12 @@ public final class BuildIvfIndex {
     private BuildIvfIndex() {}
 
     public static void main(String[] args) throws IOException {
-        if (args.length != 1) {
-            System.err.println("usage: BuildIvfIndex <output.idx>");
+        if (args.length != 2) {
+            System.err.println("usage: BuildIvfIndex <output.idx> <clustered.bin>");
             System.exit(1);
         }
-        Path output = Path.of(args[0]);
+        Path idxOut = Path.of(args[0]);
+        Path binOut = Path.of(args[1]);
 
         AppConfig cfg = AppConfig.fromEnv();
         System.out.println("[build-idx] cfg=" + cfg);
@@ -52,13 +53,13 @@ public final class BuildIvfIndex {
         System.out.println("[build-idx] IVF built in "
                 + (System.currentTimeMillis() - tBuild0) + "ms");
 
+        // Layout CLUSTERED: .idx (posting list = identidade) + dataset .bin com
+        // as linhas reordenadas por cluster → varredura de cluster sequencial.
         long tSave0 = System.currentTimeMillis();
-        if (output.getParent() != null) {
-            Files.createDirectories(output.getParent());
-        }
-        ivf.save(output);
-        long size = Files.size(output);
-        System.out.println("[build-idx] wrote " + output + ": "
-                + size + " bytes in " + (System.currentTimeMillis() - tSave0) + "ms");
+        ivf.writeClusteredArtifacts(ds, idxOut, binOut);
+        System.out.println("[build-idx] clustered artifacts written in "
+                + (System.currentTimeMillis() - tSave0) + "ms: "
+                + idxOut + " (" + Files.size(idxOut) + " B), "
+                + binOut + " (" + Files.size(binOut) + " B)");
     }
 }
