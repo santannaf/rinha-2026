@@ -1,5 +1,5 @@
 x-api: &api
-  image: thalessantanna/rinha-2026-java:0.2.0
+  image: thalessantanna/rinha-2026-java:0.2.1
 
 services:
   api1:
@@ -15,9 +15,11 @@ services:
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
       PERF_LOG: "${PERF_LOG:-false}"
+      MMAP: "${MMAP:-false}"
       MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
       MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-false}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+      WARMUP_ITERATIONS: "${WARMUP_ITERATIONS:-20000}"
     volumes:
       - sockets:/sockets
     cpuset: "0"
@@ -36,14 +38,15 @@ services:
       DATASET_PATH: /resources/references-clustered.bin
       IVF_INDEX_PATH: /resources/references.idx
       VECTOR_INDEX: "${VECTOR_INDEX:-IVF}"
-      IVF_CENTROIDS: "4096"
       IVF_NPROBE: "${IVF_NPROBE:-2}"
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
       PERF_LOG: "${PERF_LOG:-false}"
+      MMAP: "${MMAP:-false}"
       MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
       MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-false}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
+      WARMUP_ITERATIONS: "${WARMUP_ITERATIONS:-20000}"
     volumes:
       - sockets:/sockets
     cpuset: "1"

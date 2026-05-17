@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.MappedByteBuffer;
+import java.nio.ShortBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -92,9 +93,10 @@ public final class BinaryDataset {
         byte[] header = in.readNBytes(HEADER_BYTES);
         int count = validateHeader(header);
         if ((header[6] & 0xff) == DTYPE_INT16) {
-            // Caminho streaming-heap só suporta float32. O .bin int16 (dataset
-            // clustered) é sempre carregado via mmap em runtime.
-            throw new IOException("int16 .bin requires mmap (MMAP=true)");
+            // .bin int16 (dataset clustered) → short[] em heap. Antes só o mmap
+            // suportava int16; com MMAP=false o scan lê de um short[] direto,
+            // sem ShortBuffer mmap'd nem risco de page fault no hot path.
+            return readInt16(in, count);
         }
         long flatLen = (long) count * DIM;
         if (flatLen > Integer.MAX_VALUE) {
@@ -131,6 +133,43 @@ public final class BinaryDataset {
         }
 
         return new ReferenceDataset(flat, labels, count);
+    }
+
+    /**
+     * Lê a região de vetores int16 do {@code .bin} clustered direto pra um
+     * {@code short[]} em heap — espelha o caminho float32 de {@link #read},
+     * mas em short. Usado com MMAP=false: o scan do índice acessa um array
+     * puro em vez de um {@code ShortBuffer} mmap'd.
+     */
+    private static ReferenceDataset readInt16(InputStream in, int count) throws IOException {
+        long flatLen = (long) count * DIM;
+        if (flatLen > Integer.MAX_VALUE) {
+            throw new IOException("Dataset too large: " + count + " records");
+        }
+        short[] flat = new short[(int) flatLen];
+        byte[] shortBytes = new byte[FLOATS_PER_CHUNK * 2];
+        ByteBuffer bb = ByteBuffer.wrap(shortBytes).order(ByteOrder.LITTLE_ENDIAN);
+        long readSoFar = 0;
+        while (readSoFar < flatLen) {
+            int chunkShorts = (int) Math.min(FLOATS_PER_CHUNK, flatLen - readSoFar);
+            int chunkBytes = chunkShorts * 2;
+            int got = in.readNBytes(shortBytes, 0, chunkBytes);
+            if (got != chunkBytes) {
+                throw new IOException("Short int16 region at " + readSoFar
+                        + ": expected " + chunkBytes + ", got " + got);
+            }
+            bb.position(0);
+            for (int i = 0; i < chunkShorts; i++) {
+                flat[(int) (readSoFar + i)] = bb.getShort();
+            }
+            readSoFar += chunkShorts;
+        }
+        byte[] labels = new byte[count];
+        int labelsGot = in.readNBytes(labels, 0, count);
+        if (labelsGot != count) {
+            throw new IOException("Short labels region: expected " + count + ", got " + labelsGot);
+        }
+        return ReferenceDataset.quantized(ShortBuffer.wrap(flat), labels, count);
     }
 
     /**
