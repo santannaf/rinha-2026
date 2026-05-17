@@ -1,5 +1,5 @@
 x-api: &api
-  image: thalessantanna/rinha-2026-java:0.1.0
+  image: thalessantanna/rinha-2026-java:0.2.0
 
 # Variante de controle: nginx + upstream TCP (sem UDS).
 # Mesma topologia / mesmo binário do docker-compose.yml; diferença é só o

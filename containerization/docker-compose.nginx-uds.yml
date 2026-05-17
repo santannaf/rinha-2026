@@ -1,5 +1,5 @@
 x-api: &api
-  image: thalessantanna/rinha-2026-java:0.1.0
+  image: thalessantanna/rinha-2026-java:0.2.0
 
 # Variante nginx + UDS. Era o default antes de o HAProxy vencer no bench
 # (p99 médio 2.93ms vs 3.96ms do nginx). Mantido pra A/B reproduzível.

@@ -1,5 +1,5 @@
 x-api: &api
-  image: thalessantanna/rinha-2026-java:0.1.0
+  image: thalessantanna/rinha-2026-java:0.2.0
 
 services:
   api1:
@@ -25,8 +25,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
-          memory: "155M"
+          cpus: "0.44"
+          memory: "165M"
 
   api2:
     <<: *api
@@ -51,8 +51,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
-          memory: "155M"
+          cpus: "0.44"
+          memory: "165M"
 
   lb:
     image: haproxy:3.0-alpine
@@ -68,8 +68,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
-          memory: "40M"
+          cpus: "0.12"
+          memory: "20M"
 
 volumes:
   sockets:
