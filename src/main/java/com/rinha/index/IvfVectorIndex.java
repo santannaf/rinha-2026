@@ -2,16 +2,16 @@ package com.rinha.index;
 
 import com.rinha.distance.DistanceMetric;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.ShortBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -94,12 +94,15 @@ public final class IvfVectorIndex implements VectorIndex {
     }
 
     /**
-     * Construtor para instâncias carregadas via {@link #loadMmap}. Deriva os
+     * Construtor para instâncias carregadas via {@link #load} (e derivadas
+     * via {@link #withNProbe}). No layout clustered a posting list é sempre a
+     * identidade {@code (0..n-1)}, então NÃO carregamos {@code postingList}:
+     * {@code identityPostings} é true e o scan usa o índice direto. Deriva os
      * arrays int16 (rows do dataset, bbox quantizada) a partir do que foi lido.
      */
     private IvfVectorIndex(DistanceMetric metric, int nProbe,
                            ReferenceDataset dataset,
-                           double[] centroids, int[] postingStart, IntBuffer postingList,
+                           double[] centroids, int[] postingStart,
                            float[] bboxMin, float[] bboxMax, short[] rows) {
         this.metric = metric;
         this.numCentroids = postingStart.length - 1;
@@ -108,11 +111,11 @@ public final class IvfVectorIndex implements VectorIndex {
         this.dataset = dataset;
         this.centroids = centroids;
         this.postingStart = postingStart;
-        this.postingList = postingList;
+        this.postingList = null;          // identidade — índice direto no scan
         this.bboxMin = bboxMin;
         this.bboxMax = bboxMax;
         this.rows = rows;
-        this.identityPostings = isIdentity(postingList);
+        this.identityPostings = true;
         quantizeBbox();
     }
 
@@ -126,11 +129,11 @@ public final class IvfVectorIndex implements VectorIndex {
      * memória — postingList e rows são buffers compartilhados.
      */
     public IvfVectorIndex withNProbe(int newNProbe) {
-        if (dataset == null || centroids == null || postingStart == null || postingList == null) {
-            throw new IllegalStateException("withNProbe requires build()/loadMmap first");
+        if (dataset == null || centroids == null || postingStart == null || rows == null) {
+            throw new IllegalStateException("withNProbe requires build()/load first");
         }
         return new IvfVectorIndex(metric, newNProbe, dataset,
-                centroids, postingStart, postingList, bboxMin, bboxMax, rows);
+                centroids, postingStart, bboxMin, bboxMax, rows);
     }
 
     @Override
@@ -782,110 +785,83 @@ public final class IvfVectorIndex implements VectorIndex {
     }
 
     /**
-     * Carrega um índice .idx via mmap. O {@code dataset} deve ser o .bin
-     * clustered int16 (linhas já em ordem de cluster). centroids + postingStart
-     * + bbox vão pra heap; postingList vira IntBuffer direto sobre o arquivo.
+     * Carrega um índice {@code .idx} v2 inteiro pro heap, lendo via
+     * {@link DataInputStream} sobre {@link BufferedInputStream}. ZERO mmap:
+     * sem {@link MappedByteBuffer}, sem {@code madvise}, sem page faults no
+     * hot path — todo o índice (centroids / postingStart / bbox) fica em
+     * arrays Java. No layout clustered a posting list é a identidade
+     * {@code (0..n-1)}: NÃO é carregada do arquivo — o scan usa o índice
+     * direto ({@code identityPostings} sempre true).
+     *
+     * O {@code dataset} deve ser o {@code .bin} clustered int16 (linhas já
+     * em ordem de cluster, lido pra heap por {@link com.rinha.dataset.BinaryDataset}).
      */
-    public static IvfVectorIndex loadMmap(DistanceMetric metric, int nProbe,
-                                          Path path, ReferenceDataset dataset) throws IOException {
-        return loadMmap(metric, nProbe, path, dataset, false, false);
-    }
+    public static IvfVectorIndex load(DistanceMetric metric, int nProbe,
+                                      Path path, ReferenceDataset dataset) throws IOException {
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(
+                Files.newInputStream(path, StandardOpenOption.READ), 1 << 20))) {
 
-    public static IvfVectorIndex loadMmap(DistanceMetric metric, int nProbe,
-                                          Path path, ReferenceDataset dataset,
-                                          boolean prefetch, boolean hugepage) throws IOException {
-        try (FileChannel ch = FileChannel.open(path, StandardOpenOption.READ)) {
-            long fileSize = ch.size();
-            if (fileSize < HEADER_BYTES) {
-                throw new IOException(".idx too small: " + fileSize);
-            }
-            MappedByteBuffer mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);
-            mapped.order(ByteOrder.LITTLE_ENDIAN);
-
-            if (hugepage) {
-                boolean ok = com.rinha.dataset.NativeMemAdvise.hugePage(mapped);
-                System.out.println("[ivf] madvise HUGEPAGE: " + (ok ? "ok" : "skipped"));
-            }
-            if (prefetch) {
-                com.rinha.dataset.NativeMemAdvise.willNeed(mapped);
-                long t0 = System.currentTimeMillis();
-                mapped.load();
-                System.out.println("[ivf] pre-fault " + (fileSize >> 20)
-                        + " MiB in " + (System.currentTimeMillis() - t0) + "ms");
-            }
-
-            int magic = mapped.getInt(0);
+            // ---- header (32 bytes, little-endian) ----
+            int magic = readIntLE(in);
             if (magic != MAGIC) {
                 throw new IOException("Bad .idx magic: not a RVII index");
             }
-            int version = mapped.getInt(4) & 0xff;
+            int version = readIntLE(in) & 0xff;
             if (version != VERSION) {
                 throw new IOException("Unsupported .idx version: " + version);
             }
-            int k = mapped.getInt(8);
-            int dim = mapped.getInt(12);
-            int n = mapped.getInt(16);
+            int k = readIntLE(in);
+            int dim = readIntLE(in);
+            int n = readIntLE(in);
             if (dim != ReferenceDataset.DIM) {
                 throw new IOException("Dim mismatch in .idx: " + dim + " vs " + ReferenceDataset.DIM);
             }
             if (n != dataset.size()) {
                 throw new IOException(".idx built for N=" + n + " but dataset has N=" + dataset.size());
             }
+            // os 12 bytes restantes do header de 32 são reservados/zerados.
+            in.skipNBytes(HEADER_BYTES - 20);
 
-            long centroidsBytes = (long) k * dim * 4;
-            long postingStartBytes = (long) (k + 1) * 4;
-            long postingListBytes = (long) n * 4;
-            long bboxBytes = (long) k * dim * 4;  // cada um — temos 2 (min,max)
-            long expected = HEADER_BYTES + centroidsBytes + postingStartBytes
-                    + postingListBytes + 2 * bboxBytes;
-            if (fileSize < expected) {
-                throw new IOException(".idx truncated: have " + fileSize + ", expected " + expected);
-            }
-
+            // ---- centroids: k*dim float32 → double[] heap ----
             double[] centroids = new double[k * dim];
-            mapped.position(HEADER_BYTES);
-            ByteBuffer centroidsRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            centroidsRegion.limit((int) centroidsBytes);
-            FloatBuffer centroidsFB = centroidsRegion.asFloatBuffer();
             for (int i = 0; i < k * dim; i++) {
-                centroids[i] = centroidsFB.get(i);
+                centroids[i] = readFloatLE(in);
             }
 
+            // ---- postingStart: (k+1) int32 → int[] heap ----
             int[] postingStart = new int[k + 1];
-            mapped.position(HEADER_BYTES + (int) centroidsBytes);
-            ByteBuffer psRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            psRegion.limit((int) postingStartBytes);
-            IntBuffer psIB = psRegion.asIntBuffer();
             for (int i = 0; i <= k; i++) {
-                postingStart[i] = psIB.get(i);
+                postingStart[i] = readIntLE(in);
             }
 
-            int plStart = HEADER_BYTES + (int) centroidsBytes + (int) postingStartBytes;
-            mapped.position(plStart);
-            ByteBuffer plRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            plRegion.limit((int) postingListBytes);
-            IntBuffer postingList = plRegion.asIntBuffer();
+            // ---- posting list: n int32. No layout clustered é a identidade
+            //      (0,1,...,n-1) — NÃO carregamos pro heap, só pulamos a região.
+            //      O scan usa o índice direto (identityPostings = true). ----
+            in.skipNBytes((long) n * 4);
 
-            int bbMinStart = plStart + (int) postingListBytes;
-            int bbMaxStart = bbMinStart + (int) bboxBytes;
+            // ---- bbox min / max: k*dim float32 cada → float[] heap ----
             float[] bboxMin = new float[k * dim];
+            for (int i = 0; i < k * dim; i++) {
+                bboxMin[i] = readFloatLE(in);
+            }
             float[] bboxMax = new float[k * dim];
-            mapped.position(bbMinStart);
-            ByteBuffer bbMinRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            bbMinRegion.limit((int) bboxBytes);
-            FloatBuffer bbMinFB = bbMinRegion.asFloatBuffer();
-            for (int i = 0; i < k * dim; i++) bboxMin[i] = bbMinFB.get(i);
-
-            mapped.position(bbMaxStart);
-            ByteBuffer bbMaxRegion = mapped.slice().order(ByteOrder.LITTLE_ENDIAN);
-            bbMaxRegion.limit((int) bboxBytes);
-            FloatBuffer bbMaxFB = bbMaxRegion.asFloatBuffer();
-            for (int i = 0; i < k * dim; i++) bboxMax[i] = bbMaxFB.get(i);
+            for (int i = 0; i < k * dim; i++) {
+                bboxMax[i] = readFloatLE(in);
+            }
 
             return new IvfVectorIndex(metric, nProbe, dataset,
-                    centroids, postingStart, postingList, bboxMin, bboxMax,
-                    heapRows(dataset));
+                    centroids, postingStart, bboxMin, bboxMax, heapRows(dataset));
         }
+    }
+
+    private static int readIntLE(DataInputStream in) throws IOException {
+        int b0 = in.read(), b1 = in.read(), b2 = in.read(), b3 = in.read();
+        if ((b0 | b1 | b2 | b3) < 0) throw new IOException("unexpected EOF in .idx");
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    private static float readFloatLE(DataInputStream in) throws IOException {
+        return Float.intBitsToFloat(readIntLE(in));
     }
 
     private int numCentroids() {

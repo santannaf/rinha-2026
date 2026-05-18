@@ -75,7 +75,10 @@ public final class AppConfig {
         b.ivfNProbe = Math.max(1, intEnv("IVF_NPROBE", 8));
         b.indexSeed = longEnv("INDEX_SEED", 42L);
         b.boundaryFallback = boolEnv("BOUNDARY_FALLBACK", false);
-        b.mmap = boolEnv("MMAP", true);
+        // O caminho de runtime IVF é 100% heap (índice via DataInputStream,
+        // dataset via BinaryDataset.read/readInt16). MMAP fica false por
+        // padrão — sem MappedByteBuffer nem madvise no hot path.
+        b.mmap = boolEnv("MMAP", false);
         b.ivfIndexPath = strEnv("IVF_INDEX_PATH", "");
         b.boundaryFallbackNProbe = Math.max(1, intEnv("BOUNDARY_FALLBACK_NPROBE", 32));
         b.httpServer = strEnv("HTTP_SERVER", "NIO").toUpperCase();
