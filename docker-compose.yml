@@ -1,5 +1,5 @@
 x-api: &api
-  image: thalessantanna/rinha-2026-java:0.2.1
+  image: thalessantanna/rinha-2026-java:0.2.2
 
 services:
   api1:
@@ -14,19 +14,18 @@ services:
       IVF_NPROBE: "${IVF_NPROBE:-2}"
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
-      PERF_LOG: "${PERF_LOG:-false}"
-      MMAP: "${MMAP:-false}"
-      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
-      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-false}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
       WARMUP_ITERATIONS: "${WARMUP_ITERATIONS:-20000}"
+      PERF_LOG: "${PERF_LOG:-false}"
     volumes:
       - sockets:/sockets
     cpuset: "0"
+    logging:
+      driver: "none"
     deploy:
       resources:
         limits:
-          cpus: "0.44"
+          cpus: "0.45"
           memory: "165M"
 
   api2:
@@ -41,19 +40,18 @@ services:
       IVF_NPROBE: "${IVF_NPROBE:-2}"
       BOUNDARY_FALLBACK: "${BOUNDARY_FALLBACK:-true}"
       BOUNDARY_FALLBACK_NPROBE: "${BOUNDARY_FALLBACK_NPROBE:-32}"
-      PERF_LOG: "${PERF_LOG:-false}"
-      MMAP: "${MMAP:-false}"
-      MMAP_PREFETCH: "${MMAP_PREFETCH:-true}"
-      MMAP_HUGEPAGE: "${MMAP_HUGEPAGE:-false}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-true}"
       WARMUP_ITERATIONS: "${WARMUP_ITERATIONS:-20000}"
+      PERF_LOG: "${PERF_LOG:-false}"
     volumes:
       - sockets:/sockets
     cpuset: "1"
+    logging:
+      driver: "none"
     deploy:
       resources:
         limits:
-          cpus: "0.44"
+          cpus: "0.45"
           memory: "165M"
 
   lb:
@@ -67,10 +65,12 @@ services:
       - api1
       - api2
     cpuset: "2"
+    logging:
+      driver: "none"
     deploy:
       resources:
         limits:
-          cpus: "0.12"
+          cpus: "0.10"
           memory: "20M"
 
 volumes:

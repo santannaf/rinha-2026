@@ -68,7 +68,7 @@ public final class AnalyzeFailures {
         String idxPath = cfg.ivfIndexPath();
         if (idxPath != null && !idxPath.isEmpty()
                 && Files.exists(Path.of(idxPath))) {
-            index = IvfVectorIndex.loadMmap(metric, cfg.ivfNProbe(),
+            index = IvfVectorIndex.load(metric, cfg.ivfNProbe(),
                     Path.of(idxPath), dataset);
             System.out.println("[analyze] loaded IVF .idx from " + idxPath);
         } else {

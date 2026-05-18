@@ -94,9 +94,8 @@ public final class Main {
                         && "IVF".equals(cfg.vectorIndex());
                 if (wantPersist && java.nio.file.Files.exists(java.nio.file.Path.of(idxPath))) {
                     System.out.println("[main] loading IVF index from " + idxPath);
-                    index = IvfVectorIndex.loadMmap(metric, cfg.ivfNProbe(),
-                            java.nio.file.Path.of(idxPath), dataset,
-                            cfg.mmapPrefetch(), cfg.mmapHugepage());
+                    index = IvfVectorIndex.load(metric, cfg.ivfNProbe(),
+                            java.nio.file.Path.of(idxPath), dataset);
                     System.out.println("[main] index loaded: " + index.name()
                             + " in " + (System.currentTimeMillis() - tb) + "ms");
                 } else {
